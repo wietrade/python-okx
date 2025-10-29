@@ -1,4 +1,25 @@
-# ======================== 导入必要的库 ========================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ETH perpetual trading bot for OKX.
+
+说明（中文）：
+- 启动时使用 REST 加载合约元信息、账户余额并转换为 USDT。
+- 运行时优先使用 WebSocket 更新持仓、余额、订单与行情：订阅私有频道 positions、balance_and_position、orders，可选 fills；公共频道使用 tickers。
+- 下单支持 REST 与 WS 两种发送方式（默认使用 REST），提供批量下单与批量撤单的封装，且在发送前自动限速。
+- active_orders 以 orders WS 推送为最终来源；WS 的 op="order"/"batch-orders"/"cancel-order"/"batch-cancel-orders" 的直接响应也会被记录并与 active_orders 关联。
+- 提供 Mock 模式（USE_MOCK=1）便于离线测试。
+
+使用：
+- 通过环境变量设置 OKX API：OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
+- OKX_FLAG=1 为模拟盘，=0 为实盘
+- USE_MOCK=1 使用内置 Mock API，不连接外部服务（推荐初次测试）
+
+作者备注：
+- 请先在模拟盘或 USE_MOCK=1 下完成测试，再在实盘运行。
+- 切勿在公开场景中泄露 API Secret/Passphrase。
+"""
+
 import asyncio
 import time
 import json
@@ -6,1724 +27,1626 @@ import logging
 import string
 import random
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
-import pytz
-import pandas as pd
-import numpy as np
-import requests
-from okx.websocket.WsPrivateAsync import WsPrivateAsync as PrivateWs
-from okx.websocket.WsPublicAsync import WsPublicAsync as PublicWs
-import okx.Account as Account
-import okx.Trade as Trade
-import okx.MarketData as MarketData
-from supertrend_lib1 import SupertrendAnalyzer  # 使用您提供的库
+from decimal import Decimal, getcontext, ROUND_HALF_UP
+from typing import Optional, Dict, Any, List
 
+# 尝试导入 OKX SDK（私有与公共 WS、Account/Trade/Market）
+try:
+    from okx.websocket.WsPrivateAsync import WsPrivateAsync as PrivateWs
+except Exception:
+    PrivateWs = None
+try:
+    from okx.websocket.WsPublicAsync import WsPublicAsync as PublicWs
+except Exception:
+    PublicWs = None
 
-# ======================== 日志系统配置 ========================
-def setup_logging():
-    os.makedirs("logs", exist_ok=True)
-    logger = logging.getLogger("intelligent_trading_bot")
-    logger.setLevel(logging.DEBUG)
+try:
+    import okx.Account as Account
+    import okx.Trade as Trade
+    import okx.MarketData as MarketData
+except Exception:
+    Account = None
+    Trade = None
+    MarketData = None
 
-    file_handler = logging.FileHandler("logs/trading.log")
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+getcontext().prec = 28
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter('%(message)s'))
+# -------------------- 配置 & 默认值 --------------------
+USE_MOCK = os.getenv("USE_MOCK", "0") == "1"
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
+API_KEY = os.getenv("OKX_API_KEY", "")
+SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
+PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 
+OKX_FLAG = os.getenv("OKX_FLAG", "1")  # "1" testnet, "0" live
 
-logger = setup_logging()
+RUN_FOREVER = True
 
-
-def log_action(action, details, level="info", extra_data=None, exc_info=False):
-    symbols = {
-        "info": "🟢",
-        "warning": "🟠",
-        "error": "🔴",
-        "critical": "⛔"
-    }
-    symbol = symbols.get(level, "⚪")
-    header = f"\n{'-' * 80}\n[{datetime.now().strftime('%H:%M:%S.%f')}] {symbol} {action}"
-    log_line = header + f"\n  • {details}"
-
-    if extra_data:
-        try:
-            if isinstance(extra_data, dict):
-                log_line += f"\n  • 附加数据: {json.dumps(extra_data, indent=2)}"
-            else:
-                log_line += f"\n  • 附加数据: {extra_data}"
-        except:
-            log_line += f"\n  • 附加数据: [无法序列化]"
-
-    log_line += f"\n{'-' * 80}"
-
-    if level == "info":
-        logger.info(log_line, exc_info=exc_info)
-    elif level == "warning":
-        logger.warning(log_line, exc_info=exc_info)
-    elif level == "error":
-        logger.error(log_line, exc_info=exc_info)
-    elif level == "critical":
-        logger.critical(log_line, exc_info=exc_info)
-
-
-def log_state_transition(current_state, new_state, reason):
-    """记录状态转换 - 增加更多上下文信息"""
-    global trading_phase
-
-    # 获取当前仓位信息
-    long_key = get_position_key(SYMBOL, "long")
-    short_key = get_position_key(SYMBOL, "short")
-    long_pos = position_info[long_key]["pos"]
-    short_pos = position_info[short_key]["pos"]
-
-    # 计算ETH价值
-    long_eth = calculate_contract_value(long_pos)
-    short_eth = calculate_contract_value(short_pos)
-
-    logger.info(f"\n{'=' * 80}")
-    logger.info(f"🔄 状态变更: [{current_state}] → [{new_state}]")
-    logger.info(f"  原因: {reason}")
-    logger.info(f"  当前方向: {trading_direction.upper()}")
-    logger.info(f"  多仓: {long_pos}张 ({long_eth:.6f} ETH) | 空仓: {short_pos}张 ({short_eth:.6f} ETH)")
-    logger.info(f"  当前价格: ${current_price:.4f}")
-    logger.info(f"  账户净值: ${account_equity:.2f}")
-    logger.info(f"  活跃订单: {len(active_orders)}个")
-    logger.info(f"  最后趋势检查: {datetime.fromtimestamp(last_trend_check).strftime('%H:%M:%S')}")
-    logger.info(f"{'=' * 80}\n")
-
-
-# ======================== 基础配置 ========================
-API_KEY = "a3a2a008-576a-4548-a1c0-f28ac940bd6b"
-SECRET_KEY = "3F9170BCBE9C88EDFA6675438CD0DBAA"
-PASSPHRASE = "Aa123414.."
-
-# ======================== 交易对基础信息 ========================
-CONTRACT_INFO = {
+CONTRACT_INFO: Dict[str, Any] = {
     "symbol": "ETH-USDT-SWAP",
-    "lotSz": 1,  # 下单数量精度
-    "minSz": 1,  # 最小下单数量
-    "ctVal": 0.01,  # 合约面值 (每张合约代表0.1 ETH)
-    "tickSz": 0.1,  # 价格精度
-    "ctValCcy": "ETH",  # 合约价值货币
-    "instType": "SWAP"  # 合约类型
+    "lotSz": 1,
+    "minSz": 0.0,     # will be fetched
+    "ctVal": 0.0,     # will be fetched (contract face value)
+    "tickSz": 0.0,    # will be fetched
+    "ctValCcy": "ETH",
+    "instType": "SWAP",
+    "instIdCode": None,
+    "instFamily": None
 }
-
-# 使用合约信息配置全局变量
 SYMBOL = CONTRACT_INFO["symbol"]
-TICK_SIZE = CONTRACT_INFO["tickSz"]  
+TICK_SIZE = CONTRACT_INFO["tickSz"]
 
-# Supertrend策略配置
-SUPERTREND_CONFIG = {
-    'symbol': SYMBOL,
-    'timeframe': '1H',
-    'atr_period': 7,
-    'multiplier': 2.5,
-    'change_atr': True,
-    'min_data': 50,
-    'data_delay': 1
-}
-
-# ======================== 全局配置常量 ========================
-PING_INTERVAL = 25  # WebSocket心跳间隔
-PONG_TIMEOUT = 5  # Pong响应超时时间
-
-# 交易策略配置
 TRADE_STRATEGY = {
-    "price_offset": 0.015,  # 价格偏移0.05% 0.1
-    "eth_position": 0.01, # 目标BNB持仓量
-    "leverage": 10,  # 杠杆倍数
-    "atr_multiplier": 0.7,  # ATR系数
-    "order_increment": 0,  # 开仓单在基础仓位上增加的合约张数0.05=0.005ETH
-     "fixed_trend_direction": "long"  # 新增: 固定趋势方向 (long/short)
+    "price_offset": 0.015,
+    "eth_position": 0.01,
+    "leverage": 10,
+    "order_increment": 0,
+    "fixed_trend_direction": "long",
+    "trend_mode": "fixed"
 }
 
-# 全局变量
-account_equity = 0.0
-initial_equity = 0.0
-current_price = 0.0
-last_price = 0.0
-trading_direction = "long"
-last_trend_check = 0
-last_ws_price_update = 0
-last_api_price_update = 0
-price_source = "unknown"
-# 日志
-last_status_log_time = 0
-STATUS_LOG_INTERVAL = 60  # 60秒记录一次摘要
+# -------------------- 日志 --------------------
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "trading.log")
 
-# 订单和仓位管理
-active_orders = {}  # 使用 cl_ord_id 作为键
-position_info = defaultdict(lambda: {
-    "pos": 0.0,  # 合约张数
-    "eth_value": 0.0,  # ETH价值
-    "avg_px": 0.0,
-    "upl": 0.0,
-    "entry_time": 0
-})
-
-# 订单对映射
-order_pair_mapping = {}  # 使用 pair_id 作为键，存储订单对信息
-
-# API客户端
-flag = "0"
-account_api = Account.AccountAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, flag)
-trade_api = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, flag)
-market_api = MarketData.MarketAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, flag)
-
-# WebSocket实例
-ws_private = None
-ws_public = None
-
-# 初始化Supertrend分析器
-supertrend_analyzer = SupertrendAnalyzer(SUPERTREND_CONFIG)
+logger = logging.getLogger("eth_trade_bot")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    fh = logging.FileHandler(LOG_FILE)
+    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(fh)
+    logger.addHandler(ch)
 
 
-# ======================== ETH合约工具函数 ========================
-def calculate_contract_value(sz):
-    """计算合约实际价值 (ETH数量)"""
-    return sz * CONTRACT_INFO["ctVal"]
-
-
-def calculate_contract_size(eth_amount):
-    """根据ETH数量计算合约张数"""
-    return eth_amount / CONTRACT_INFO["ctVal"]
-
-
-def round_to_min_size(size):
-    """调整数量到最小交易单位的整数倍"""
-    min_lot = CONTRACT_INFO["minSz"]
-    return round(size / min_lot) * min_lot
-
-
-def validate_position_size(size):
-    """验证仓位大小是否符合要求"""
-    min_size = CONTRACT_INFO["minSz"]
-    if size < min_size:
-        log_action("风控", f"仓位大小{size}小于最小值{min_size}，自动修正", "warning")
-        return min_size
-
-    # 检查是否为最小单位的整数倍
-    if not (size / min_size).is_integer():
-        log_action("风控", f"仓位大小{size}不是最小单位{min_size}的整数倍", "error")
-        return round_to_min_size(size)
-
-    return size
-
-
-def get_position_size():
-    """根据ETH目标持仓计算合约张数"""
-    eth_amount = TRADE_STRATEGY["eth_position"]
-    contract_size = calculate_contract_size(eth_amount)
-    return round_to_min_size(contract_size)  # 确保符合最小单位
-
-
-def get_size_precision():
-    """获取数量精度的小数位数"""
-    min_sz = CONTRACT_INFO["minSz"]
-    # 计算需要的小数位数
-    if min_sz >= 1:
-        return 0
-    elif min_sz >= 0.1:
-        return 1
-    elif min_sz >= 0.01:
-        return 2
-    elif min_sz >= 0.001:
-        return 3
+def log_action(action: str, details: str, level: str = "info", extra_data: Optional[dict] = None, exc_info: bool = False):
+    symbols = {"debug": "🔵", "info": "🟢", "warning": "🟠", "error": "🔴", "critical": "⛔"}
+    symbol = symbols.get(level, "⚪")
+    header = "\n" + "-" * 80 + "\n" + f"[{datetime.now().strftime('%H:%M:%S.%f')}] {symbol} {action}"
+    line = header + f"\n  • {details}"
+    if extra_data is not None:
+        try:
+            line += f"\n  • 附加数据: {json.dumps(extra_data, ensure_ascii=False, indent=2)}"
+        except Exception:
+            line += f"\n  • 附加数据: {extra_data}"
+    line += "\n" + "-" * 80
+    if level == "debug":
+        logger.debug(line, exc_info=exc_info)
+    elif level == "warning":
+        logger.warning(line, exc_info=exc_info)
+    elif level == "error":
+        logger.error(line, exc_info=exc_info)
+    elif level == "critical":
+        logger.critical(line, exc_info=exc_info)
     else:
-        return 4  # 默认4位小数
+        logger.info(line, exc_info=exc_info)
 
 
-def get_price_precision():
-    """获取价格精度的小数位数"""
-    tick_sz = CONTRACT_INFO["tickSz"]
-    # 计算需要的小数位数
-    if tick_sz >= 1:
-        return 0
-    elif tick_sz >= 0.1:
-        return 1
-    elif tick_sz >= 0.01:
-        return 2
-    elif tick_sz >= 0.001:
-        return 3
-    else:
-        return 4  # 默认4位小数
+# -------------------- 全局运行时状态 --------------------
+# 账户 USDT 等价总额
+account_equity_usdt: float = 0.0
+initial_equity_usdt: float = 0.0
 
+# 价格与来源
+current_price: float = 0.0
+last_price: float = 0.0
+price_source: str = "unknown"
+last_ws_price_update: float = 0.0
+last_api_price_update: float = 0.0
 
-def validate_order_increment():
-    """验证开仓增量配置是否有效"""
-    increment = TRADE_STRATEGY.get("order_increment", 0)
-    min_sz = CONTRACT_INFO["minSz"]
+trading_direction = TRADE_STRATEGY.get("fixed_trend_direction", "long")
+INSTRUMENTS_LOADED = False
 
-    if increment <= 0:
-        log_action("配置验证", "开仓增量必须大于0", "error")
-        return False
+# 订单 / 仓位 存储
+active_orders: Dict[str, dict] = {}
+order_pair_mapping: Dict[str, dict] = {}
+position_info = defaultdict(lambda: {"pos": 0.0, "usdt_value": 0.0, "avg_px": 0.0, "upl": 0.0, "entry_time": 0})
 
-    if increment < min_sz:
-        log_action("配置验证",
-                   f"开仓增量({increment})小于最小交易单位({min_sz})，自动修正",
-                   "warning")
-        TRADE_STRATEGY["order_increment"] = min_sz
-        return True
+# API clients（initialize_clients 填充）
+account_api = None
+trade_api = None
+market_api = None
 
-    # 检查是否为最小单位的整数倍
-    if not (increment / min_sz).is_integer():
-        log_action("配置验证",
-                   f"开仓增量({increment})不是最小单位({min_sz})的整数倍",
-                   "error")
-        TRADE_STRATEGY["order_increment"] = round_to_min_size(increment)
-        return True
+# 私有 WS 实例
+_ws_instance = None
 
-    return True
+# 公共 WS 实例（tickers）
+_public_ws_instance = None
 
+# seen 去重集合（WS orders / fills）
+seen_trade_ids = set()
+seen_filled_ordids = set()
+seen_reqids = set()
 
-# ======================== 交易阶段定义 ========================
-class TradingPhase:
-    INIT = "INIT"
-    A1_POSITION_SETUP = "A1"  # 新增: 仓位建立阶段
-    A2_ORDER_PAIR = "A2"  # 订单对阶段
-    B2_WAIT_PAIR = "B2"  # 订单对监控阶段
+# public tickers 最优价记录
+best_bid: float = 0.0
+best_ask: float = 0.0
 
+# 是否启用公共行情 WS
+ENABLE_PUBLIC_TICKER = True
+# 是否订阅 fills 频道（需 VIP5+）
+ENABLE_FILLS_CHANNEL = False
 
-# 当前交易阶段
-trading_phase = TradingPhase.INIT
-phase_start_time = 0
-
-
-# ======================== 核心功能函数 ========================
-def get_position_key(inst_id, pos_side):
-    """获取持仓唯一键"""
-    return f"{inst_id}-{pos_side.lower()}"
-
-
-def generate_order_id(prefix):
-    """生成符合OKX要求的订单ID"""
-    clean_prefix = ''.join(c for c in prefix if c.isalnum())
-    rand_part = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-    return (clean_prefix + rand_part)[:32]
-
-
-def round_price(price):
-    """根据精度调整价格"""
-    return round(price / TICK_SIZE) * TICK_SIZE
-
-
-def safe_float(value, default=0.0):
-    """安全转换浮点数"""
+# -------------------- 工具函数 --------------------
+def safe_float(v, default: float = 0.0) -> float:
     try:
-        return float(value) if value else default
-    except (ValueError, TypeError):
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
         return default
 
 
-# ======================== 账户与市场数据 ========================
-async def fetch_account_balance():
-    """获取账户余额 - 增加详细日志"""
-    global account_equity, initial_equity
+def generate_order_id(prefix: str) -> str:
+    clean = ''.join(c for c in prefix if c.isalnum())
+    suffix = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+    ts = int(time.time() * 1000) % 1000000
+    return (clean + str(ts) + suffix)[:32]
 
+
+def round_price(price: float) -> float:
+    tick_val = CONTRACT_INFO.get("tickSz", 0) or TICK_SIZE or 0
     try:
-        log_action("账户查询", "发送账户余额请求", "debug")
-        response = account_api.get_account_balance(ccy="USDT")
-
-        # 记录完整响应
-        log_action("账户查询", "收到账户余额响应", "debug", response)
-
-        if response["code"] == "0" and response.get("data"):
-            for detail in response["data"][0].get("details", []):
-                if detail["ccy"] == "USDT":
-                    equity = float(detail["eq"])
-                    account_equity = equity
-                    if initial_equity == 0:
-                        initial_equity = equity
-                        log_action("账户初始化", f"初始权益: ${initial_equity:.2f}")
-                    return True
-        return False
-    except Exception as e:
-        log_action("账户查询", f"请求失败: {str(e)}", "error", exc_info=True)
-        return False
+        tick = Decimal(str(tick_val))
+        p = Decimal(str(price))
+        if tick == 0:
+            return float(p)
+        quant = (p / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        rounded = (quant * tick).normalize()
+        return float(rounded)
+    except Exception:
+        return float(price)
 
 
-def log_periodic_status():
-    """记录周期性状态摘要"""
-    global last_status_log_time
-
-    current_time = time.time()
-    if current_time - last_status_log_time >= STATUS_LOG_INTERVAL:
-        last_status_log_time = current_time
-
-        long_key = get_position_key(SYMBOL, "long")
-        short_key = get_position_key(SYMBOL, "short")
-        long_pos = position_info[long_key]["pos"]
-        short_pos = position_info[short_key]["pos"]
-
-        # 计算ETH价值
-        long_eth = calculate_contract_value(long_pos)
-        short_eth = calculate_contract_value(short_pos)
-
-        logger.info(f"\n{'=' * 80}")
-        logger.info(f"📊 当前状态摘要 - {trading_phase}")
-        logger.info(f"  当前方向: {trading_direction.upper()}")
-        logger.info(f"  多仓: {long_pos}张 ({long_eth:.6f} ETH) | 空仓: {short_pos}张 ({short_eth:.6f} ETH)")
-        logger.info(f"  当前价格: ${current_price:.4f}")
-        logger.info(f"  账户净值: ${account_equity:.2f}")
-        logger.info(f"  活跃订单: {len(active_orders)}个")
-        logger.info(f"  最后趋势检查: {datetime.fromtimestamp(last_trend_check).strftime('%H:%M:%S')}")
-        logger.info(f"  开仓增量配置: {TRADE_STRATEGY['order_increment']}张")
-        logger.info(f"{'=' * 80}\n")
-
-
-async def update_position_info():
-    """获取持仓信息 - 增加详细日志"""
+def round_to_min_size(size: float) -> float:
+    min_sz = CONTRACT_INFO.get("minSz", 0) or 0
     try:
-        log_action("仓位查询", "发送仓位查询请求", "debug")
-        response = account_api.get_positions(instType="SWAP")
+        m = Decimal(str(min_sz))
+        s = Decimal(str(size))
+        if m == 0:
+            return float(s)
+        q = (s / m).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        rounded = (q * m).normalize()
+        return float(rounded)
+    except Exception:
+        return float(size)
 
-        # 记录完整响应
-        log_action("仓位查询", "收到仓位查询响应", "debug", response)
 
-        if response["code"] == "0":
-            positions = response.get("data", [])
+def validate_position_size(sz: float) -> float:
+    """
+    校验下单数量，若小于 minSz 则抛异常或调整为 minSz。
+    当前策略：若小于 minSz，则调整到 minSz；你也可以改为抛错终止下单。
+    """
+    min_sz = CONTRACT_INFO.get("minSz", 0) or 0
+    if min_sz <= 0:
+        return sz
+    if sz <= 0:
+        raise ValueError("下单数量必须大于 0")
+    # 若小于最小单位，调整为最小单位
+    if sz < min_sz:
+        sz = min_sz
+    return sz
 
-            # 重置仓位信息
-            for key in position_info:
-                position_info[key]["pos"] = 0.0
-                position_info[key]["eth_value"] = 0.0
-                position_info[key]["avg_px"] = 0.0
-                position_info[key]["upl"] = 0.0
-                position_info[key]["entry_time"] = 0
 
-            # 更新有效仓位
-            for pos in positions:
-                if pos["instId"] == SYMBOL:
-                    pos_side = pos["posSide"].lower()
-                    pos_key = get_position_key(SYMBOL, pos_side)
+# -------------------- Mock APIs（便于本地测试） --------------------
+class MockTradeAPI:
+    def place_order(self, **kwargs):
+        return {"code": "0", "data": [{"ordId": f"mock_{int(time.time() * 1000)}", "clOrdId": kwargs.get("clOrdId", "")}]}
 
-                    contract_size = float(pos.get("pos", "0"))
-                    eth_value = calculate_contract_value(contract_size)
+    def place_multiple_orders(self, batch):
+        return {"code": "0", "data": [{"clOrdId": r.get("clOrdId", ""), "sCode": "0", "ordId": f"mock_{random.randint(1000, 9999)}"} for r in batch]}
 
-                    position_info[pos_key]["pos"] = contract_size
-                    position_info[pos_key]["eth_value"] = eth_value
-                    position_info[pos_key]["avg_px"] = float(pos.get("avgPx", "0"))
-                    position_info[pos_key]["upl"] = float(pos.get("upl", "0"))
+    def cancel_order(self, **kwargs):
+        return {"code": "0", "data": []}
 
-                    log_action("仓位更新",
-                               f"{pos_side}仓: {contract_size}张 ({eth_value:.6f} ETH)",
-                               "debug")
+    def cancel_multiple_orders(self, requests):
+        return {"code": "0", "data": []}
 
-            return True
-        return False
+
+class MockAccountAPI:
+    def get_account_balance(self, **kwargs):
+        # return sample balances: USDT and BTC
+        return {"code": "0", "data": [{"details": [{"ccy": "USDT", "eq": "1000.0"}, {"ccy": "BTC", "eq": "0.01"}]}]}
+
+    def get_positions(self, **kwargs):
+        return {"code": "0", "data": []}
+
+    def get_instruments(self, **kwargs):
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "instId": CONTRACT_INFO["symbol"],
+                    "minSz": "0.01",
+                    "tickSz": "0.01",
+                    "ctVal": "0.1",
+                    "lotSz": "0.01",
+                    "ctValCcy": "ETH",
+                    "instIdCode": "2021032601102994",
+                    "instFamily": "ETH-USDT"
+                }
+            ]
+        }
+
+
+class MockMarketAPI:
+    def get_ticker(self, *args, **kwargs):
+        # return last for symbol
+        return {"code": "0", "data": [{"last": str(1000.0 if current_price == 0 else current_price)}]}
+
+
+# -------------------- 限速器 --------------------
+class RateLimiter:
+    def __init__(self):
+        self.last_request_time = 0.0
+        self.request_count = 0
+        self.window_start = time.time()
+        self.max_orders_per_window = 300
+        self.window_seconds = 2
+
+    async def check_limit(self, orders_count, max_per_window=None, window_seconds=None):
+        max_orders = max_per_window if max_per_window is not None else self.max_orders_per_window
+        win = window_seconds if window_seconds is not None else self.window_seconds
+        now = time.time()
+        elapsed = now - self.window_start
+        if elapsed > win:
+            self.request_count = 0
+            self.window_start = now
+            elapsed = 0
+        predicted = self.request_count + orders_count
+        while predicted > max_orders:
+            wait = max(0.0, win - elapsed + 0.05)
+            log_action("限速器", f"等待 {wait:.2f}s 避免速率上限", "warning")
+            await asyncio.sleep(wait)
+            now = time.time()
+            elapsed = now - self.window_start
+            if elapsed > win:
+                self.request_count = 0
+                self.window_start = now
+                break
+            predicted = self.request_count + orders_count
+        # small gap between requests
+        if now - self.last_request_time < 0.05:
+            await asyncio.sleep(max(0.0, 0.05 - (now - self.last_request_time)))
+        self.request_count += orders_count
+        self.last_request_time = time.time()
+        log_action("限速器", f"计数: {self.request_count}/{max_orders}", "debug", {"orders": orders_count})
+
+
+rate_limiter = RateLimiter()
+
+
+async def check_rate_limit(n: int, max_per_window: Optional[int] = None, window_seconds: Optional[int] = None):
+    await rate_limiter.check_limit(n, max_per_window=max_per_window, window_seconds=window_seconds)
+
+
+# -------------------- REST：合约 / 价格 / 仓位 / 余额 --------------------
+async def fetch_instrument_info_from_api() -> bool:
+    """
+    Fetch instrument metadata using account_api.get_instruments and update CONTRACT_INFO.
+    """
+    global CONTRACT_INFO, TICK_SIZE, SYMBOL, INSTRUMENTS_LOADED
+    try:
+        await check_rate_limit(1, max_per_window=20, window_seconds=2)
+        inst_type = CONTRACT_INFO.get("instType", "SWAP")
+        log_action("合约信息", f"请求合约信息 instType={inst_type} instId={CONTRACT_INFO.get('symbol')}", "debug")
+        try:
+            resp = await asyncio.to_thread(account_api.get_instruments, instType=inst_type, instId=CONTRACT_INFO.get("symbol"))
+        except TypeError:
+            resp = await asyncio.to_thread(account_api.get_instruments, inst_type, CONTRACT_INFO.get("symbol"))
+        log_action("合约信息", "收到合约信息响应（原始）", "debug", resp)
+        if not isinstance(resp, dict) or str(resp.get("code", "")) != "0" or not resp.get("data"):
+            log_action("合约信息", "获取合约信息返回异常或 data 为空", "warning", resp)
+            INSTRUMENTS_LOADED = False
+            return False
+        inst_list = resp.get("data", [])
+        target = CONTRACT_INFO.get("symbol", "")
+        found = None
+        for item in inst_list:
+            if item.get("instId") == target:
+                found = item
+                break
+        if not found and target:
+            base = target.split("-")[0]
+            for item in inst_list:
+                iid = item.get("instId", "")
+                if iid.startswith(f"{base}-") and "USDT" in iid:
+                    found = item
+                    break
+        if not found:
+            log_action("合约信息", f"未找到匹配合约: {target}", "warning", {"returned_count": len(inst_list)})
+            INSTRUMENTS_LOADED = False
+            return False
+
+        def _parse_float_safe(x, fallback=0.0):
+            try:
+                if x is None or x == "":
+                    return float(fallback)
+                return float(x)
+            except Exception:
+                return float(fallback)
+
+        minSz = _parse_float_safe(found.get("minSz", CONTRACT_INFO.get("minSz", 0)), CONTRACT_INFO.get("minSz", 0))
+        tickSz = _parse_float_safe(found.get("tickSz", CONTRACT_INFO.get("tickSz", 0)), CONTRACT_INFO.get("tickSz", 0))
+        ctVal = _parse_float_safe(found.get("ctVal", CONTRACT_INFO.get("ctVal", 0)), CONTRACT_INFO.get("ctVal", 0))
+        lotSz = _parse_float_safe(found.get("lotSz", CONTRACT_INFO.get("lotSz", 0)), CONTRACT_INFO.get("lotSz", 0))
+        ctValCcy = found.get("ctValCcy", CONTRACT_INFO.get("ctValCcy", "ETH"))
+        inst_code = found.get("instIdCode", CONTRACT_INFO.get("instIdCode"))
+        inst_family = found.get("instFamily", CONTRACT_INFO.get("instFamily"))
+        CONTRACT_INFO.update({
+            "minSz": minSz,
+            "tickSz": tickSz,
+            "ctVal": ctVal,
+            "lotSz": lotSz,
+            "ctValCcy": ctValCcy,
+            "instIdCode": inst_code,
+            "instFamily": inst_family
+        })
+        TICK_SIZE = CONTRACT_INFO["tickSz"]
+        SYMBOL = CONTRACT_INFO.get("symbol")
+        INSTRUMENTS_LOADED = True
+        log_action("合约信息", "已更新 CONTRACT_INFO（归一化）", "info", {
+            "symbol": SYMBOL,
+            "minSz": minSz,
+            "tickSz": tickSz,
+            "ctVal": ctVal,
+            "lotSz": lotSz,
+            "ctValCcy": ctValCcy,
+            "instIdCode": inst_code,
+            "instFamily": inst_family
+        })
+        return True
     except Exception as e:
-        log_action("仓位查询", f"请求失败: {str(e)}", "error", exc_info=True)
+        INSTRUMENTS_LOADED = False
+        log_action("合约信息", f"获取合约信息异常: {e}", "error", exc_info=True)
         return False
 
 
-async def update_current_price():
-    """获取当前价格 - 通过API备选 - 增加详细日志"""
+async def update_current_price() -> bool:
+    """
+    Query market ticker via REST and update current_price.
+    """
     global current_price, last_price, last_api_price_update, price_source
-
     try:
-        log_action("价格查询", "发送价格查询请求", "debug")
-        response = market_api.get_ticker(instId=SYMBOL)
-
-        # 记录完整响应
-        log_action("价格查询", "收到价格查询响应", "debug", response)
-
-        if response["code"] == "0" and response.get("data"):
-            price = float(response["data"][0]["last"])
-
-            # 更新价格和时间戳
+        await check_rate_limit(1)
+        log_action("价格查询", "请求 ticker", "debug")
+        try:
+            resp = await asyncio.to_thread(market_api.get_ticker, instId=SYMBOL)
+        except TypeError:
+            resp = await asyncio.to_thread(market_api.get_ticker, SYMBOL)
+        log_action("价格查询", "收到响应", "debug", resp)
+        if isinstance(resp, dict) and str(resp.get("code", "")) in ("0", 0) and resp.get("data"):
+            data0 = resp["data"][0]
+            price = None
+            for key in ("last", "lastPx", "price", "c", "close"):
+                if key in data0:
+                    price = safe_float(data0.get(key, 0), 0.0)
+                    break
+            if price is None:
+                log_action("价格查询", "无法解析 ticker 返回中的价格字段", "warning", data0)
+                return False
             last_price = current_price
             current_price = price
             last_api_price_update = time.time()
             price_source = "rest_api"
-
-            log_action("API价格更新", f"${last_price:.4f} → ${price:.4f}", "info")
+            log_action("API价格更新", f"${last_price:.4f} -> ${price:.4f}", "info")
             return True
-        return False
     except Exception as e:
-        log_action("价格查询", f"请求失败: {str(e)}", "error", exc_info=True)
-        return False
-
-
-async def ensure_price_freshness():
-    """确保价格足够新鲜 - 增加详细日志"""
-    global price_source
-
-    # 记录当前状态
-    ws_freshness = time.time() - last_ws_price_update
-    api_freshness = time.time() - last_api_price_update
-    log_action("价格新鲜度",
-               f"WS新鲜度: {ws_freshness:.2f}s | API新鲜度: {api_freshness:.2f}s",
-               "debug")
-
-    # 如果WebSocket价格在2秒内更新过，使用WebSocket价格
-    if ws_freshness <= 2.0:
-        price_source = "websocket"
-        log_action("价格新鲜度", f"使用WS价格(新鲜度:{ws_freshness:.2f}s)", "debug")
-        return True
-
-    # 如果API价格在5秒内更新过，使用API价格
-    if api_freshness <= 5.0:
-        price_source = "rest_api"
-        log_action("价格新鲜度", f"使用API价格(新鲜度:{api_freshness:.2f}s)", "debug")
-        return True
-
-    # 主动更新价格
-    log_action("价格更新", "价格数据过期，主动获取最新价格", "warning")
-    return await update_current_price()
-
-
-# ======================== 订单管理 ========================
-class RateLimiter:
-    """OKX API速率限制管理器 - 增加详细日志"""
-
-    def __init__(self):
-        self.last_request_time = 0
-        self.request_count = 0
-        self.window_start = time.time()
-        self.max_orders_per_window = 300  # 每2秒300个订单
-        self.window_seconds = 2
-
-    async def check_limit(self, orders_count):
-        """检查并遵守API速率限制"""
-        current_time = time.time()
-
-        # 检查当前时间窗口
-        window_elapsed = current_time - self.window_start
-        if window_elapsed > self.window_seconds:
-            log_action("限速器", f"窗口重置 (已过{window_elapsed:.2f}s > {self.window_seconds}s)", "debug")
-            self.request_count = 0
-            self.window_start = current_time
-
-        # 预测请求后是否超出限制
-        predicted_count = self.request_count + orders_count
-        while predicted_count > self.max_orders_per_window:
-            # 计算需要等待的时间
-            wait_time = max(0.0, self.window_seconds - window_elapsed + 0.1)
-            log_action("限速等待",
-                       f"需等待{wait_time:.2f}秒 (当前{self.request_count}/{self.max_orders_per_window}，请求后{predicted_count})",
-                       "warning")
-            await asyncio.sleep(wait_time)
-            current_time = time.time()
-            window_elapsed = current_time - self.window_start
-
-            if window_elapsed > self.window_seconds:
-                log_action("限速器", f"等待后窗口重置 (已过{window_elapsed:.2f}s > {self.window_seconds}s)", "debug")
-                self.request_count = 0
-                self.window_start = current_time
-                break
-
-            predicted_count = self.request_count + orders_count
-
-        # 避免请求过快（即使未达限制）
-        if current_time - self.last_request_time < 0.1:
-            wait_time = 0.1 - (current_time - self.last_request_time)
-            log_action("限速等待", f"避免请求过快，等待{wait_time:.3f}s", "debug")
-            await asyncio.sleep(wait_time)
-
-        # 更新计数器
-        self.request_count += orders_count
-        self.last_request_time = time.time()
-        log_action("限速器", f"请求计数: {self.request_count}/{self.max_orders_per_window}", "debug",
-                   {"订单数": orders_count})
-
-
-# 全局速率限制器实例
-rate_limiter = RateLimiter()
-
-
-async def check_rate_limit(orders_count):
-    """应用速率限制"""
-    await rate_limiter.check_limit(orders_count)
-
-
-async def cancel_all_orders():
-    """取消所有活跃订单 - 增加详细日志"""
-    try:
-        if active_orders:
-            order_ids = list(active_orders.keys())
-            order_count = len(order_ids)
-            log_action("订单取消", f"取消{order_count}个订单", "info")
-
-            # 应用速率限制
-            await check_rate_limit(order_count)
-
-            # 批量取消请求
-            cancel_reqs = [{"instId": SYMBOL, "clOrdId": cl_ord_id} for cl_ord_id in order_ids]
-            log_action("批量取消", "发送批量取消请求", "debug", {"订单列表": order_ids})
-            response = trade_api.cancel_multiple_orders(cancel_reqs)
-
-            # 记录完整响应
-            log_action("批量取消", "收到批量取消响应", "debug", response)
-
-            if response.get("code") == "0":
-                active_orders.clear()
-                return True
-        return True  # 没有订单也算成功
-    except Exception as e:
-        log_action("取消订单", f"取消失败: {str(e)}", "error", exc_info=True)
-        return False
-
-
-async def cancel_single_order(cl_ord_id):
-    """取消单个订单 - 增加详细日志"""
-    try:
-        # 应用速率限制
-        await check_rate_limit(1)
-
-        request = {"instId": SYMBOL, "clOrdId": cl_ord_id}
-        log_action("取消订单", f"发送取消请求: {cl_ord_id}", "debug", request)
-        response = trade_api.cancel_order(**request)
-
-        # 记录完整响应
-        log_action("取消订单", f"收到取消响应: {cl_ord_id}", "debug", response)
-
-        if response["code"] == "0":
-            log_action("订单取消", f"订单 {cl_ord_id} 取消成功")
-            return True
-        else:
-            log_action("订单取消", f"订单 {cl_ord_id} 取消失败: {response.get('msg', '未知错误')}", "warning")
-            return False
-    except Exception as e:
-        log_action("取消订单", f"取消订单 {cl_ord_id} 失败: {str(e)}", "error")
-        return False
-
-
-# ======================== 新增: A1阶段 - 仓位建立 ========================
-async def place_market_setup_order(adjust_size):
-    """根据当前趋势方向市价建仓 - 增加详细日志"""
-    # 确保数量有效
-    if adjust_size <= 0:
-        log_action("A1下单", "调整量为0，无需建仓", "warning")
-        return True
-
-    try:
-        # 确定下单方向
-        side = "buy" if trading_direction == "long" else "sell"
-
-        # 生成订单ID
-        cl_ord_id = generate_order_id(f"A1_{trading_direction[:1]}")
-
-        # 验证并调整仓位大小
-        validated_size = validate_position_size(adjust_size)
-        eth_value = calculate_contract_value(validated_size)
-
-        request = {
-            "instId": SYMBOL,
-            "tdMode": "isolated",
-            "clOrdId": cl_ord_id,
-            "side": side,
-            "posSide": trading_direction,
-            "ordType": "market",
-            "sz": str(validated_size)
-        }
-
-        # 应用速率限制
-        await check_rate_limit(1)
-
-        # 发送下单请求
-        log_action("A1下单", "发送市价开仓请求", "debug", request)
-        response = trade_api.place_order(**request)
-
-        # 记录完整响应
-        log_action("A1下单", "收到下单响应", "debug", response)
-
-        if response["code"] == "0":
-            # 记录活跃订单
-            ord_id = response['data'][0]['ordId']
-            active_orders[cl_ord_id] = {
-                "ord_id": ord_id,
-                "state": "live",
-                "type": "market",
-                "tag": "A1_SETUP",
-                "create_time": time.time(),
-                "side": side,
-                "posSide": trading_direction
-            }
-
-            log_action("A1下单", f"市价{trading_direction}建仓单已提交", "info", {
-                "调整仓位": f"{validated_size}张 ({eth_value:.6f} ETH)",
-                "订单ID": cl_ord_id
-            })
-            return True
-
-        # 处理下单失败
-        log_action("A1下单", f"市价建仓失败: {response.get('msg', '未知错误')}", "error")
-        return False
-    except Exception as e:
-        log_action("A1下单", f"市价建仓异常: {str(e)}", "error", exc_info=True)
-        return False
-
-
-# ======================== 重构: A2阶段 - 挂订单对 (OKX批量下单) ========================
-async def calculate_dynamic_offset():
-    """计算价格偏移 - 简化版本，只使用固定偏移"""
-    # 直接从配置中获取基础偏移参数
-    base_offset = TRADE_STRATEGY["price_offset"]
-
-    # 记录简单的调试信息
-    log_action("价格偏移", f"使用固定偏移: {base_offset * 100:.2f}%", "debug")
-
-    return base_offset
-
-
-async def place_open_order_only():
-    """只挂开仓单的逻辑"""
-    # 生成订单ID
-    open_cl_ord_id = generate_order_id("OPEN_ONLY")
-
-    # 计算开仓价格
-    offset_percent = await calculate_dynamic_offset()
-    if trading_direction == "long":
-        open_price = round_price(current_price * (1 - offset_percent))
-    else:
-        open_price = round_price(current_price * (1 + offset_percent))
-
-    # 获取仓位大小
-    contract_size = get_position_size()
-    eth_value = calculate_contract_value(contract_size)
-
-    # 创建开仓单请求
-    request = {
-        "instId": SYMBOL,
-        "tdMode": "isolated",
-        "clOrdId": open_cl_ord_id,
-        "side": "buy" if trading_direction == "long" else "sell",
-        "posSide": trading_direction,
-        "ordType": "limit",
-        "px": str(open_price),
-        "sz": str(contract_size),
-        "reduceOnly": False
-    }
-
-    try:
-        await check_rate_limit(1)
-        response = trade_api.place_order(**request)
-
-        if response["code"] == "0":
-            ord_id = response['data'][0]['ordId']
-            active_orders[open_cl_ord_id] = {
-                "ord_id": ord_id,
-                "state": "live",
-                "type": "limit",
-                "tag": "OPEN_ONLY",
-                "create_time": time.time(),
-                "side": request["side"],
-                "posSide": trading_direction,
-                "px": open_price,
-                "sz": contract_size
-            }
-            log_action("开仓单", f"开仓单已提交 {open_cl_ord_id}", "info", {
-                "价格": open_price,
-                "方向": trading_direction,
-                "数量": f"{contract_size}张 ({eth_value:.6f} ETH)"
-            })
-            return True
-        log_action("开仓单", f"开仓单失败: {response.get('msg', '未知错误')}", "error")
-        return False
-    except Exception as e:
-        log_action("开仓单", f"挂单失败: {str(e)}", "error")
-        return False
-
-
-async def place_full_order_pair(offset_percent):
-    """挂完整订单对"""
-    # 生成订单对ID
-    pair_id = generate_order_id("PAIR")
-    open_tag = "BL" if trading_direction == "long" else "SS"  # BL = Buy Long, SS = Sell Short
-    close_tag = "SL" if trading_direction == "short" else "SC"  # SL = Sell Long, SC = Cover Short
-
-    # 计算开仓和平仓价格
-    if trading_direction == "long":
-        open_price = round_price(current_price * (1 - offset_percent))  # 低位挂买单
-        close_price = round_price(current_price * (1 + offset_percent))  # 高位挂卖单
-    else:
-        open_price = round_price(current_price * (1 + offset_percent))  # 高位挂卖单
-        close_price = round_price(current_price * (1 - offset_percent))  # 低位挂买单
-
-    # 获取基础仓位大小
-    base_contract_size = get_position_size()
-
-    # 获取开仓增量配置值
-    order_increment = TRADE_STRATEGY["order_increment"]
-
-    # 开仓单增加配置的增量
-    open_contract_size = base_contract_size + order_increment
-    open_contract_size = validate_position_size(open_contract_size)
-
-    # 平仓单保持原大小
-    close_contract_size = base_contract_size
-
-    # 计算ETH价值
-    base_eth_value = calculate_contract_value(base_contract_size)
-    increment_eth_value = calculate_contract_value(order_increment)
-    open_eth_value = calculate_contract_value(open_contract_size)
-    close_eth_value = calculate_contract_value(close_contract_size)
-
-    # 创建开仓单
-    open_cl_ord_id = generate_order_id(f"{open_tag}_{pair_id}")
-    open_request = {
-        "instId": SYMBOL,
-        "tdMode": "isolated",
-        "clOrdId": open_cl_ord_id,
-        "side": "buy" if trading_direction == "long" else "sell",
-        "posSide": trading_direction,
-        "ordType": "limit",
-        "px": str(open_price),
-        "sz": str(open_contract_size),  # 使用修改后的开仓数量
-        "reduceOnly": False
-    }
-
-    # 创建平仓单
-    close_cl_ord_id = generate_order_id(f"{close_tag}_{pair_id}")
-    close_request = {
-        "instId": SYMBOL,
-        "tdMode": "isolated",
-        "clOrdId": close_cl_ord_id,
-        "side": "sell" if trading_direction == "long" else "buy",
-        "posSide": trading_direction,
-        "ordType": "limit",
-        "px": str(close_price),
-        "sz": str(close_contract_size),  # 使用原始平仓数量
-        "reduceOnly": True
-    }
-
-    # 批量订单请求
-    batch_requests = [open_request, close_request]
-
-    # 记录订单对关系（提前记录以处理回调）
-    order_pair_mapping[pair_id] = {
-        "open_cl_ord_id": open_cl_ord_id,
-        "close_cl_ord_id": close_cl_ord_id,
-        "status": "pending",
-        "create_time": time.time()
-    }
-
-    try:
-        # 应用速率限制 (2个订单)
-        await check_rate_limit(2)
-
-        # 提交批量订单
-        log_action("批量下单", "提交批量订单请求", "info", {
-            "订单对ID": pair_id,
-            "开仓请求": open_request,
-            "平仓请求": close_request,
-            "价格偏移": f"{offset_percent * 100:.2f}%",
-            "当前价格": current_price,
-            "基础仓位": f"{base_contract_size}张 ({base_eth_value:.6f} ETH)",
-            "开仓增量": f"{order_increment}张 ({increment_eth_value:.6f} ETH)",
-            "开仓总量": f"{open_contract_size}张 ({open_eth_value:.6f} ETH)"
-        })
-        response = trade_api.place_multiple_orders(batch_requests)
-
-        # 记录完整响应
-        log_action("批量下单", "收到批量下单响应", "debug", response)
-
-        # 检查主响应代码
-        if response.get("code") != "0":
-            log_action("批量下单", "批量接口主响应错误", "error", response)
-            del order_pair_mapping[pair_id]  # 清理临时记录
-            return False
-
-        # 处理每个订单的响应
-        order_data = response.get("data", [])
-        success_orders = []
-        failure_orders = []
-
-        for result in order_data:
-            cl_ord_id = result.get("clOrdId", "")
-            s_code = result.get("sCode", "")
-            ord_id = result.get("ordId", "")  # 服务器分配的订单ID
-            s_msg = result.get("sMsg", "")
-
-            if s_code == "0":  # 成功
-                success_orders.append({
-                    "cl_ord_id": cl_ord_id,
-                    "ord_id": ord_id,
-                    "request": next(r for r in batch_requests if r["clOrdId"] == cl_ord_id)
-                })
-            else:
-                failure_orders.append({
-                    "cl_ord_id": cl_ord_id,
-                    "s_code": s_code,
-                    "s_msg": s_msg,
-                    "ord_id": ord_id
-                })
-
-        # 处理部分失败情况
-        if failure_orders:
-            log_action("批量下单", f"{len(failure_orders)}个订单失败", "error", failure_orders)
-
-            # 取消已成功的订单
-            if success_orders:
-                for order in success_orders:
-                    await cancel_single_order(order["cl_ord_id"])
-                log_action("批量下单", f"已取消{len(success_orders)}个成功订单", "warning")
-
-            # 清理订单对映射
-            del order_pair_mapping[pair_id]
-            return False
-
-        # 记录活跃订单
-        for order in success_orders:
-            # 确定订单类型（开仓单还是平仓单）
-            if open_tag in order["cl_ord_id"]:
-                order_type = "open"
-                tag = open_tag
-            else:
-                order_type = "close"
-                tag = close_tag
-
-            # 记录到活跃订单
-            active_orders[order["cl_ord_id"]] = {
-                "ord_id": order["ord_id"],
-                "state": "live",
-                "type": "limit",
-                "tag": tag,
-                "create_time": time.time(),
-                "side": order["request"]["side"],
-                "posSide": trading_direction,
-                "pair_id": pair_id,
-                "px": order["request"]["px"],
-                "sz": order["request"]["sz"]
-            }
-
-            log_action("订单记录", f"{order_type}订单已记录", "info", {
-                "cl_ord_id": order["cl_ord_id"],
-                "ord_id": order["ord_id"],
-                "price": order["request"]["px"],
-                "size": f"{order['request']['sz']}张"
-            })
-
-        # 更新订单对状态
-        order_pair_mapping[pair_id]["status"] = "active"
-        log_action("批量下单", "✅ 订单对挂单成功", "info", {
-            "pair_id": pair_id,
-            "开仓价": open_price,
-            "平仓价": close_price,
-            "价格偏移": f"{offset_percent * 100:.2f}%",
-            "当前价格": current_price,
-            "基础仓位": f"{base_contract_size}张 ({base_eth_value:.6f} ETH)",
-            "开仓增量": f"{order_increment}张 ({increment_eth_value:.6f} ETH)",
-            "开仓总量": f"{open_contract_size}张 ({open_eth_value:.6f} ETH)"
-        })
-        return True
-
-    except Exception as e:
-        log_action("批量下单", f"批量下单异常: {str(e)}", "error", exc_info=True)
-        if pair_id in order_pair_mapping:
-            del order_pair_mapping[pair_id]
-        return False
-
-
-async def place_order_pair():
-    """挂完整订单对 - 简化版本，不考虑持仓均价"""
-    # 确保价格新鲜
-    if not await ensure_price_freshness():
-        log_action("A2下单", "无法获取最新价格", "error")
-        return False
-
-    # 计算动态偏移量
-    offset_percent = await calculate_dynamic_offset()
-
-    # 直接挂完整订单对
-    log_action("订单对", "无价格限制，挂完整订单对", "info")
-    return await place_full_order_pair(offset_percent)
-
-
-# ======================== 趋势分析 ========================
-# ======================== 趋势分析 ========================
-async def analyze_trend():
-    """分析Supertrend趋势并返回方向 - 固定版本"""
-    global trading_direction, last_trend_check
-    
-    # 更新最后趋势检查时间
-    last_trend_check = time.time()
-    
-    # 直接使用配置的固定趋势方向
-    fixed_direction = TRADE_STRATEGY["fixed_trend_direction"]
-    
-    # 如果当前方向与固定方向不同，更新方向
-    if trading_direction != fixed_direction:
-        log_action("趋势更新", 
-                   f"更新趋势方向: {trading_direction} → {fixed_direction}", 
-                   "warning",
-                   {"reason": "使用配置的固定趋势方向"})
-        trading_direction = fixed_direction
-    
-    # 始终返回False表示趋势未变化
+        log_action("价格查询", f"异常: {e}", "error", exc_info=True)
     return False
 
 
-async def close_position(pos_side):
-    """平掉指定方向的仓位 - 增加详细日志"""
-    if pos_side not in ["long", "short"]:
-        return
-
-    pos_key = get_position_key(SYMBOL, pos_side)
-    pos_size = position_info[pos_key]["pos"]
-
-    if pos_size <= 0:
+async def update_position_info() -> bool:
+    """
+    Query positions via REST and update position_info.
+    """
+    global position_info
+    try:
+        await check_rate_limit(1)
+        log_action("仓位查询", "发送仓位查询请求", "debug")
+        try:
+            resp = await asyncio.to_thread(account_api.get_positions, instType=CONTRACT_INFO.get("instType", "SWAP"), instId=CONTRACT_INFO.get("symbol"))
+        except TypeError:
+            resp = await asyncio.to_thread(account_api.get_positions, CONTRACT_INFO.get("instType", "SWAP"), CONTRACT_INFO.get("symbol"))
+        log_action("仓位查询", "收到仓位查询响应", "debug", resp)
+        if not isinstance(resp, dict) or str(resp.get("code", "")) not in ("0", 0) or not resp.get("data"):
+            log_action("仓位查询", "仓位查询返回非 0 或空响应", "warning", resp)
+            return False
+        # reset only fields; keep mapping keys
+        for key in list(position_info.keys()):
+            position_info[key].update({"pos": 0.0, "usdt_value": 0.0, "avg_px": 0.0, "upl": 0.0})
+        data = resp.get("data", [])
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            inst_id = entry.get("instId") or CONTRACT_INFO.get("symbol")
+            pos_raw = entry.get("pos", entry.get("position", "0"))
+            pos = safe_float(pos_raw, 0.0)
+            pos_side = (entry.get("posSide") or "net").lower()
+            # determine logical side and absolute size
+            if pos_side == "net":
+                if pos < 0:
+                    side = "short"
+                    size = abs(pos)
+                else:
+                    side = "long"
+                    size = pos
+            elif pos_side in ("long", "short"):
+                side = pos_side
+                size = abs(pos)
+            else:
+                side = "net"
+                size = pos
+            # try to get markPx or last to compute notional in quote currency (USDT)
+            mark_px = safe_float(entry.get("markPx") or entry.get("last") or 0.0, 0.0)
+            usdt_value = 0.0
+            if mark_px and CONTRACT_INFO.get("ctVal"):
+                usdt_value = float(Decimal(str(size)) * Decimal(str(CONTRACT_INFO.get("ctVal", 0))) * Decimal(str(mark_px)))
+            else:
+                # fallback using reported notionalUsd if present
+                usdt_value = safe_float(entry.get("notionalUsd", 0.0), 0.0)
+            pk = f"{inst_id}-{side}"
+            position_info[pk]["pos"] = size
+            position_info[pk]["usdt_value"] = usdt_value
+            position_info[pk]["avg_px"] = safe_float(entry.get("avgPx", 0.0))
+            position_info[pk]["upl"] = safe_float(entry.get("upl", 0.0))
+            position_info[pk]["entry_time"] = int(time.time())
+            position_info[pk]["meta"] = {
+                "posSide_raw": entry.get("posSide"),
+                "posId": entry.get("posId"),
+                "instType": entry.get("instType"),
+                "markPx": mark_px,
+                "lever": entry.get("lever")
+            }
+            log_action("仓位更新", f"{inst_id} {side} {size} 张 -> {usdt_value:.6f} USDT", "debug", position_info[pk])
         return True
+    except Exception as e:
+        log_action("仓位查询", f"请求失败: {e}", "error", exc_info=True)
+        return False
+
+
+async def fetch_account_balance() -> bool:
+    """
+    Fetch account balances and convert all currencies to USDT-equivalent.
+    """
+    global account_equity_usdt, initial_equity_usdt
+    try:
+        await check_rate_limit(1)
+        log_action("账户查询", "发送账户余额请求", "debug")
+        try:
+            resp = await asyncio.to_thread(account_api.get_account_balance, ccy="")
+        except TypeError:
+            resp = await asyncio.to_thread(account_api.get_account_balance, "")
+        log_action("账户查询", "收到账户余额响应", "debug", resp)
+        if not isinstance(resp, dict) or str(resp.get("code", "")) not in ("0", 0) or not resp.get("data"):
+            log_action("账户查询", "账户返回异常或 data 为空", "warning", resp)
+            return False
+        total_usdt = Decimal("0")
+        balances = {}
+        # data is a list: each item has 'details' list with {ccy, availEq, eq, cashBal, frozenBal, ...}
+        for grp in resp.get("data", []):
+            details = grp.get("details") or grp.get("details", [])
+            for d in details:
+                ccy = d.get("ccy") or d.get("currency") or ""
+                # many API variants use 'eq' for total equity in that currency
+                eq = safe_float(d.get("eq", d.get("cashBal", d.get("availEq", 0.0))), 0.0)
+                balances[ccy] = eq
+        # convert each currency to USDT
+        for ccy, eq in balances.items():
+            if ccy.upper() == "USDT":
+                total_usdt += Decimal(str(eq))
+                continue
+            # Try to find a ticker to convert ccy -> USDT
+            price = None
+            candidates = [
+                f"{ccy}-USDT",
+                f"{ccy}-USDT-SWAP",
+                f"{ccy}-USDT-SWAP".replace("--", "-"),
+                f"{ccy}-USD",
+                f"{ccy}-USD-SWAP"
+            ]
+            for cand in candidates:
+                try:
+                    try:
+                        tresp = await asyncio.to_thread(market_api.get_ticker, instId=cand)
+                    except TypeError:
+                        tresp = await asyncio.to_thread(market_api.get_ticker, cand)
+                    if isinstance(tresp, dict) and str(tresp.get("code", "")) in ("0", 0) and tresp.get("data"):
+                        data0 = tresp["data"][0]
+                        for k in ("last", "lastPx", "price", "c", "close"):
+                            if k in data0:
+                                price = safe_float(data0.get(k, 0), None)
+                                break
+                        if price is not None and price > 0:
+                            log_action("余额转换", f"使用 {cand} 的价格 {price:.6f} 将 {eq} {ccy} 转换为 USDT", "debug")
+                            break
+                except Exception:
+                    price = None
+            if price is None:
+                log_action("余额转换", f"无法找到 {ccy} -> USDT 的市场价格，跳过该币种的折算（视为 0）", "warning", {"ccy": ccy})
+                continue
+            converted = Decimal(str(eq)) * Decimal(str(price))
+            total_usdt += converted
+        account_equity_usdt = float(total_usdt)
+        if initial_equity_usdt == 0.0:
+            initial_equity_usdt = account_equity_usdt
+            log_action("账户初始化", f"初始权益 (USDT): {initial_equity_usdt:.2f}", "info")
+        else:
+            log_action("账户更新", f"账户余额 (USDT): {account_equity_usdt:.2f}", "debug", {"balances": balances})
+        return True
+    except Exception as e:
+        log_action("账户查询", f"异常: {e}", "error", exc_info=True)
+        return False
+
+
+# -------------------- 下单 / 撤单（REST） --------------------
+async def place_order_simple(side: str,
+                             pos_side: str,
+                             ord_type: str,
+                             sz: str,
+                             px: Optional[str] = None,
+                             td_mode: str = "isolated",
+                             reduce_only: bool = False,
+                             tgt_ccy: Optional[str] = None,
+                             stp_mode: Optional[str] = None,
+                             attach_algo_orders: Optional[list] = None,
+                             cl_ord_id: Optional[str] = None) -> dict:
+    """
+    单笔下单封装（更严格的校验与限流）。
+    """
+    # 遵守单笔下单速率：60 次 / 2s
+    await check_rate_limit(1, max_per_window=60, window_seconds=2)
+
+    # 生成或使用 clOrdId
+    cl = cl_ord_id or generate_order_id("ORD")
+
+    # 处理并校验 sz（最小单位、整数倍）
+    try:
+        validated_sz = float(sz)
+        validated_sz = validate_position_size(validated_sz)
+        validated_sz = round_to_min_size(validated_sz)
+        sz_str = str(validated_sz)
+    except Exception:
+        sz_str = str(sz)
+
+    # 处理并校验 px（按 tickSz 四舍五入）
+    if px is not None:
+        try:
+            pxf = float(px)
+            pxf = round_price(pxf)
+            px_str = str(pxf)
+        except Exception:
+            px_str = str(px)
+    else:
+        px_str = None
+
+    req = {
+        "instId": SYMBOL,
+        "tdMode": td_mode,
+        "clOrdId": cl,
+        "side": side,
+        "ordType": ord_type,
+        "sz": sz_str
+    }
+    if pos_side:
+        req["posSide"] = pos_side
+    if px_str is not None:
+        req["px"] = px_str
+    if reduce_only:
+        req["reduceOnly"] = True
+    if tgt_ccy:
+        req["tgtCcy"] = tgt_ccy
+    if stp_mode:
+        req["stpMode"] = stp_mode
+    if attach_algo_orders:
+        req["attachAlgoOrds"] = attach_algo_orders
 
     try:
-        # 市价平仓
-        side = "sell" if pos_side == "long" else "buy"
-        cl_ord_id = generate_order_id(f"MC_{pos_side[:1]}")
+        # SDK 调用放到线程池，避免阻塞事件循环
+        resp = await asyncio.to_thread(trade_api.place_order, **req)
+        log_action("下单", "单笔下单响应", "debug", resp)
 
-        # 验证仓位大小
-        validated_size = validate_position_size(pos_size)
-        eth_value = calculate_contract_value(validated_size)
-
-        request = {
-            "instId": SYMBOL,
-            "tdMode": "isolated",
-            "clOrdId": cl_ord_id,
-            "side": side,
-            "posSide": pos_side,
-            "ordType": "market",
-            "sz": str(validated_size),
-            "reduceOnly": True
-        }
-
-        # 发送下单请求
-        log_action("平仓下单", "发送平仓请求", "debug", request)
-        response = trade_api.place_order(**request)
-
-        # 记录完整响应
-        log_action("平仓下单", "收到平仓响应", "debug", response)
-
-        if response["code"] == "0":
-            # 记录活跃订单
-            ord_id = response['data'][0]['ordId']
-            active_orders[cl_ord_id] = {
-                "ord_id": ord_id,
-                "state": "live",
-                "type": "market",
-                "tag": "MARKET_CLOSE",
-                "create_time": time.time(),
-                "side": side,
-                "posSide": pos_side
+        # 解析返回并健壮兼容大小写差异
+        if not isinstance(resp, dict):
+            log_action("下单", "下单返回非 dict", "warning", {"raw": resp})
+            active_orders[cl] = {
+                "ord_id": "",
+                "cl": cl,
+                "px": px_str,
+                "sz": sz_str,
+                "state": "unknown",
+                "raw": resp,
+                "create_time": time.time()
             }
+            return {"code": "-1", "msg": "invalid_response", "raw": resp}
 
-            log_action("平仓下单", f"{pos_side}平仓单已提交 ({validated_size}张, {eth_value:.6f} ETH)", "info")
-            return True
-        return False
+        if str(resp.get("code", "")) not in ("0", 0):
+            # API 层面返回错误（如资金不足），记录并返回原始 resp
+            log_action("下单", f"API 返回错误 code={resp.get('code')}", "warning", resp)
+            active_orders[cl] = {
+                "ord_id": "",
+                "cl": cl,
+                "px": px_str,
+                "sz": sz_str,
+                "state": "rejected",
+                "raw": resp,
+                "create_time": time.time()
+            }
+            return resp
+
+        data0 = (resp.get("data") or [{}])[0]
+        # 兼容 sCode / scode / code 等字段
+        s_code = None
+        for k in ("sCode", "scode", "code"):
+            if k in data0:
+                s_code = str(data0.get(k, ""))
+                break
+        ord_id = data0.get("ordId") or data0.get("ordid") or ""
+        ret_cl = data0.get("clOrdId") or data0.get("clordid") or cl
+
+        # 临时记录 active_orders（最终状态以 orders WS 推送为准）
+        active_orders[ret_cl] = {
+            "ord_id": ord_id,
+            "cl": ret_cl,
+            "px": req.get("px"),
+            "sz": req.get("sz"),
+            "state": "accepted" if str(s_code) in ("0", "") else "rejected",
+            "raw": data0,
+            "create_time": time.time()
+        }
+        return resp
+
     except Exception as e:
-        log_action("平仓操作", f"平仓失败: {str(e)}", "error", exc_info=True)
-        return False
+        log_action("下单", f"下单异常: {e}", "error", exc_info=True)
+        active_orders[cl] = {
+            "ord_id": "",
+            "cl": cl,
+            "px": px_str,
+            "sz": sz_str,
+            "state": "error",
+            "raw": str(e),
+            "create_time": time.time()
+        }
+        return {"code": "-1", "msg": str(e)}
 
 
-# ======================== WebSocket连接管理 ========================
-class WebSocketManager:
-    """WebSocket连接管理器 - 完全修复版本 - 增加详细日志"""
+async def place_multiple_orders_batch(batch: List[Dict[str, Any]], max_retry: int = 2) -> Dict[str, Any]:
+    """
+    批量下单封装，按订单数限流（300/2s），兼容返回字段大小写差异。
+    """
+    result = {"success": [], "failures": [], "raw": None}
+    if not batch:
+        return result
 
-    def __init__(self, channel_type, ws_class, subscribe_args, callback):
-        self.channel_type = channel_type
-        self.ws_class = ws_class
-        self.subscribe_args = subscribe_args
-        self.callback = callback
+    # 限流：按订单数量计入窗口
+    orders_count = len(batch)
+    await check_rate_limit(orders_count, max_per_window=300, window_seconds=2)
 
-        # 使用全局配置常量
-        self.ping_interval = PING_INTERVAL
-        self.pong_timeout = PONG_TIMEOUT
-
-        self.ws = None
-        self.ping_count = 0
-        self.pong_count = 0
-        self.running = True
-        self.reconnect_count = 0
-        self.message_count = 0
-        self.last_message_time = 0
-        self.waiting_for_pong = False
-        self.manual_disconnect = False
-        self.connected = False
-        self.subscribed = False
-        self.monitor_task = None
-        self.reconnect_in_progress = False
-        self.last_ping_time = 0
-
-    async def connect(self):
-        """连接到WebSocket服务器"""
+    attempt = 0
+    while attempt <= max_retry:
+        attempt += 1
         try:
-            log_action("连接", f"尝试连接到{self.channel_type}频道服务器", "info")
+            resp = await asyncio.to_thread(trade_api.place_multiple_orders, batch)
+            result["raw"] = resp
+            if not isinstance(resp, dict):
+                log_action("批量下单", f"返回非 dict（尝试 {attempt}）", "warning", resp)
+                if attempt <= max_retry:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                result["failures"].append({"error": "invalid_response", "resp": resp})
+                return result
 
-            # 创建WebSocket实例
-            if self.channel_type == "private":
-                self.ws = self.ws_class(
-                    url="wss://ws.okx.com:8443/ws/v5/private",
-                    apiKey=API_KEY,
-                    passphrase=PASSPHRASE,
-                    secretKey=SECRET_KEY,
-                    useServerTime=False
-                )
-            else:
-                self.ws = self.ws_class(url="wss://ws.okx.com:8443/ws/v5/public")
+            if str(resp.get("code", "")) not in ("0", 0):
+                log_action("批量下单", f"接口返回错误 code={resp.get('code')} (尝试 {attempt})", "error", resp)
+                if attempt <= max_retry:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                result["failures"].append({"error": "api_error", "resp": resp})
+                return result
 
-            await self.ws.start()
+            data = resp.get("data", []) or []
+            successes = []
+            failures = []
+            for item in data:
+                s_code = None
+                for key in ("sCode", "scode", "SCODE", "code"):
+                    if key in item:
+                        s_code = str(item.get(key, ""))
+                        break
+                cl = item.get("clOrdId") or item.get("clordid") or item.get("client_oid") or ""
+                ord_id = item.get("ordId") or item.get("ordid") or ""
+                if s_code is None or s_code == "":
+                    s_code = str(item.get("sCode", item.get("code", "0")))
+                if str(s_code) == "0":
+                    successes.append({"clOrdId": cl, "ordId": ord_id, "item": item})
+                else:
+                    failures.append({"clOrdId": cl, "ordId": ord_id, "sCode": s_code, "item": item})
 
-            # 重置状态
-            self.last_message_time = time.time()
-            self.ping_count = 0
-            self.pong_count = 0
-            self.waiting_for_pong = False
-            self.connected = True
+            result["success"] = successes
+            result["failures"] = failures
 
-            log_action("连接", f"{self.channel_type}频道连接已建立", "info")
-            return True
+            for s in successes:
+                cl = s["clOrdId"]
+                ord_id = s["ordId"]
+                req = next((r for r in batch if r.get("clOrdId") == cl), None)
+                px = req.get("px") if req else None
+                sz = req.get("sz") if req else None
+                active_orders[cl] = {"ord_id": ord_id, "cl": cl, "px": px, "sz": sz, "state": "live", "create_time": time.time()}
+                log_action("批量下单", f"订单成功记录 clOrdId={cl} ordId={ord_id}", "info", {"px": px, "sz": sz})
+
+            if failures:
+                log_action("批量下单", f"检测到部分失败：{len(failures)}，尝试撤销已成功订单", "warning", {"failures": failures})
+                for s in successes:
+                    cl = s["clOrdId"]
+                    try:
+                        await asyncio.to_thread(trade_api.cancel_order, instId=batch[0].get("instId"), clOrdId=cl)
+                        log_action("补偿撤单", f"已发撤单请求 clOrdId={cl}", "debug")
+                    except Exception as e:
+                        log_action("补偿撤单", f"撤单请求失败 clOrdId={cl} 异常: {e}", "error", exc_info=True)
+                return result
+
+            return result
+
         except Exception as e:
-            log_action("连接", f"{self.channel_type}频道连接失败: {str(e)}", "error")
-            return False
+            log_action("批量下单", f"place_multiple_orders 调用异常 (尝试 {attempt}): {e}", "error", exc_info=True)
+            if attempt <= max_retry:
+                await asyncio.sleep(0.5 * attempt)
+                continue
+            result["failures"].append({"error": "exception", "msg": str(e)})
+            return result
 
-    def handle_message(self, message):
-        """消息回调处理函数 - 增加详细日志"""
-        self.message_count += 1
-        self.last_message_time = time.time()
+    return result
 
-        # 记录原始消息
-        log_action("WS接收", f"{self.channel_type}频道收到消息", "debug", {"原始消息": message})
 
+async def cancel_multiple_orders_batch(requests: List[Dict[str, Any]], max_retry: int = 1) -> Dict[str, Any]:
+    """
+    批量撤单封装，按订单数限流（300/2s）。
+    """
+    ret = {"accepted": [], "rejected": [], "raw": None}
+    if not requests:
+        return ret
+
+    orders_count = len(requests)
+    await check_rate_limit(orders_count, max_per_window=300, window_seconds=2)
+
+    attempt = 0
+    while attempt <= max_retry:
+        attempt += 1
         try:
-            # 处理Pong响应
-            if "pong" in message:
-                self.pong_count += 1
-                self.waiting_for_pong = False
-                log_action("接收", f"收到Pong响应 (#{self.pong_count})", "info")
+            resp = await asyncio.to_thread(trade_api.cancel_multiple_orders, requests)
+            ret["raw"] = resp
+            if not isinstance(resp, dict):
+                log_action("批量撤单", f"返回非 dict (尝试 {attempt})", "warning", resp)
+                if attempt <= max_retry:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                ret["rejected"].append({"error": "invalid_response", "resp": resp})
+                return ret
+
+            if str(resp.get("code", "")) not in ("0", 0):
+                log_action("批量撤单", f"接口返回错误 code={resp.get('code')} (尝试 {attempt})", "error", resp)
+                if attempt <= max_retry:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                ret["rejected"].append({"error": "api_error", "resp": resp})
+                return ret
+
+            data = resp.get("data", []) or []
+            for item in data:
+                s_code = None
+                for key in ("sCode", "scode", "SCODE", "code"):
+                    if key in item:
+                        s_code = str(item.get(key, ""))
+                        break
+                if s_code is None or s_code == "":
+                    s_code = str(item.get("sCode", item.get("code", "0")))
+
+                cl = item.get("clOrdId") or item.get("clordid") or ""
+                ord_id = item.get("ordId") or item.get("ordid") or ""
+
+                if str(s_code) == "0":
+                    ret["accepted"].append({"clOrdId": cl, "ordId": ord_id, "item": item})
+                    if cl and cl in active_orders:
+                        active_orders[cl]["state"] = "cancel_pending"
+                else:
+                    ret["rejected"].append({"clOrdId": cl, "ordId": ord_id, "sCode": s_code, "item": item})
+
+            return ret
+
+        except Exception as e:
+            log_action("批量撤单", f"cancel_multiple_orders 调用异常 (尝试 {attempt}): {e}", "error", exc_info=True)
+            if attempt <= max_retry:
+                await asyncio.sleep(0.3 * attempt)
+                continue
+            ret["rejected"].append({"error": "exception", "msg": str(e)})
+            return ret
+
+    return ret
+
+
+# -------------------- 订单查询（REST） --------------------
+async def get_order_info(ordId: str = None, clOrdId: str = None, instId: str = None) -> dict:
+    """
+    使用 REST 查询单笔订单信息（get_order），并更新 active_orders。
+    """
+    if instId is None:
+        instId = SYMBOL
+    await check_rate_limit(1, max_per_window=60, window_seconds=2)
+    try:
+        resp = await asyncio.to_thread(trade_api.get_order, instId=instId, ordId=ordId, clOrdId=clOrdId)
+    except TypeError:
+        try:
+            resp = await asyncio.to_thread(trade_api.get_order, instId, ordId or "", clOrdId or "")
+        except Exception as e:
+            log_action("查询订单", f"调用 SDK get_order 异常: {e}", "error", exc_info=True)
+            return {"code": "-1", "msg": str(e)}
+
+    log_action("查询订单", "get_order 返回（原始）", "debug", resp)
+
+    try:
+        if not isinstance(resp, dict) or str(resp.get("code", "")) not in ("0", 0) or not resp.get("data"):
+            return resp
+        entry = resp["data"][0]
+        ord_id = entry.get("ordId") or entry.get("ordid") or ""
+        cl = entry.get("clOrdId") or entry.get("clordid") or ""
+        state = entry.get("state") or ""
+        acc_fill_sz = safe_float(entry.get("accFillSz", entry.get("acc_fill_sz", 0)), 0.0)
+        fill_sz = safe_float(entry.get("fillSz", entry.get("fill_sz", 0)), 0.0)
+        avg_px = safe_float(entry.get("avgPx", entry.get("avg_px", 0)), 0.0)
+        px = entry.get("px", "")
+        sz = entry.get("sz", "")
+        u_time = entry.get("uTime") or entry.get("u_time") or ""
+
+        updated = False
+        if cl:
+            ao = active_orders.get(cl, {})
+            ao.update({
+                "ord_id": ord_id,
+                "cl": cl,
+                "state": state,
+                "accFillSz": acc_fill_sz,
+                "fillSz": fill_sz,
+                "avgPx": avg_px,
+                "px": px,
+                "sz": sz,
+                "uTime": u_time,
+                "raw_order": entry
+            })
+            active_orders[cl] = ao
+            updated = True
+        else:
+            for k, v in list(active_orders.items()):
+                if v.get("ord_id") and str(v.get("ord_id")) == str(ord_id):
+                    v.update({
+                        "ord_id": ord_id,
+                        "cl": v.get("cl", ""),
+                        "state": state,
+                        "accFillSz": acc_fill_sz,
+                        "fillSz": fill_sz,
+                        "avgPx": avg_px,
+                        "px": px,
+                        "sz": sz,
+                        "uTime": u_time,
+                        "raw_order": entry
+                    })
+                    active_orders[k] = v
+                    updated = True
+                    break
+        if not updated:
+            key = cl or ord_id or generate_order_id("ORDINFO")
+            active_orders[key] = {
+                "ord_id": ord_id,
+                "cl": cl,
+                "state": state,
+                "accFillSz": acc_fill_sz,
+                "fillSz": fill_sz,
+                "avgPx": avg_px,
+                "px": px,
+                "sz": sz,
+                "uTime": u_time,
+                "raw_order": entry
+            }
+        return resp
+    except Exception as e:
+        log_action("查询订单", f"解析 get_order 返回异常: {e}", "error", exc_info=True)
+        return resp
+
+
+async def get_pending_orders(instType: str = None, instId: str = None, limit: int = 100) -> dict:
+    """
+    查询未成交订单列表（orders-pending），并更新 active_orders。
+    """
+    await check_rate_limit(1, max_per_window=60, window_seconds=2)
+    try:
+        params = {}
+        if instType:
+            params["instType"] = instType
+        if instId:
+            params["instId"] = instId
+        if limit:
+            params["limit"] = str(limit)
+        try:
+            resp = await asyncio.to_thread(trade_api.get_order_list, **params)
+        except TypeError:
+            try:
+                resp = await asyncio.to_thread(trade_api.get_order_list, params.get("instType", ""), params.get("ordType", ""))
+            except Exception as e:
+                log_action("查询未成交订单", f"调用 SDK get_order_list 异常: {e}", "error", exc_info=True)
+                return {"code": "-1", "msg": str(e)}
+        log_action("查询未成交订单", "get_order_list 返回（原始）", "debug", resp)
+        if not isinstance(resp, dict) or str(resp.get("code", "")) not in ("0", 0) or not resp.get("data"):
+            return resp
+        data = resp.get("data", []) or []
+        for entry in data:
+            try:
+                ord_id = entry.get("ordId") or entry.get("ordid") or ""
+                cl = entry.get("clOrdId") or entry.get("clordid") or ""
+                state = entry.get("state") or ""
+                px = entry.get("px", "")
+                sz = entry.get("sz", "")
+                avg_px = safe_float(entry.get("avgPx", 0), 0.0)
+                acc_fill_sz = safe_float(entry.get("accFillSz", 0), 0.0)
+                key = cl or ord_id or generate_order_id("PENDING")
+                active_orders[key] = {
+                    "ord_id": ord_id,
+                    "cl": cl,
+                    "state": state,
+                    "px": px,
+                    "sz": sz,
+                    "avgPx": avg_px,
+                    "accFillSz": acc_fill_sz,
+                    "raw_order": entry,
+                    "last_update": time.time()
+                }
+            except Exception:
+                log_action("查询未成交订单", "解析单条未成交订单异常", "warning", entry)
+        return resp
+    except Exception as e:
+        log_action("查询未成交订单", f"异常: {e}", "error", exc_info=True)
+        return {"code": "-1", "msg": str(e)}
+
+
+async def confirm_order_final_state(ordId: str = None, clOrdId: str = None, timeout: float = 5.0) -> dict:
+    """
+    快速确认订单最终状态（REST辅助）。
+    """
+    resp = await get_order_info(ordId=ordId, clOrdId=clOrdId)
+    return resp
+
+
+# -------------------- WebSocket：持仓 / 余额 / 订单 / 成交 / 公共行情 --------------------
+def _handle_positions_ws_entry(entry: Dict[str, Any]):
+    try:
+        inst_id = entry.get("instId")
+        pos_raw = entry.get("pos", "0")
+        pos = safe_float(pos_raw, 0.0)
+        pos_side = (entry.get("posSide") or "net").lower()
+        if pos_side == "net":
+            if pos < 0:
+                side = "short"
+                size = abs(pos)
+            else:
+                side = "long"
+                size = pos
+        elif pos_side in ("long", "short"):
+            side = pos_side
+            size = abs(pos)
+        else:
+            side = "net"
+            size = pos
+        mark_px = safe_float(entry.get("markPx") or entry.get("last") or 0.0, 0.0)
+        usdt_value = 0.0
+        if mark_px and CONTRACT_INFO.get("ctVal"):
+            usdt_value = float(Decimal(str(size)) * Decimal(str(CONTRACT_INFO.get("ctVal", 0))) * Decimal(str(mark_px)))
+        else:
+            usdt_value = safe_float(entry.get("notionalUsd", 0.0), 0.0)
+        pk = f"{inst_id}-{side}"
+        position_info[pk]["pos"] = size
+        position_info[pk]["usdt_value"] = usdt_value
+        position_info[pk]["avg_px"] = safe_float(entry.get("avgPx", 0.0))
+        position_info[pk]["upl"] = safe_float(entry.get("upl", 0.0))
+        position_info[pk]["entry_time"] = int(time.time())
+        log_action("WS仓位", f"{inst_id} {side} {size} -> {usdt_value:.6f}USDT", "debug", position_info[pk])
+    except Exception as e:
+        log_action("WS仓位处理", f"错误: {e}", "error", exc_info=True)
+
+
+def _handle_balance_and_position_ws_entry(entry: Dict[str, Any]):
+    global account_equity_usdt, initial_equity_usdt, last_ws_price_update
+    try:
+        bal_data = entry.get("balData", []) or entry.get("bal", [])
+        if isinstance(bal_data, dict):
+            bal_data = [bal_data]
+        total_usdt = Decimal("0")
+        for b in bal_data:
+            ccy = b.get("ccy")
+            eq = safe_float(b.get("cashBal", b.get("eq", 0.0)), 0.0)
+            if ccy and ccy.upper() == "USDT":
+                total_usdt += Decimal(str(eq))
+            else:
+                price = None
+                try:
+                    tresp = None
+                    try:
+                        tresp = market_api.get_ticker(instId=f"{ccy}-USDT")
+                    except Exception:
+                        try:
+                            tresp = market_api.get_ticker(f"{ccy}-USDT")
+                        except Exception:
+                            tresp = None
+                    if isinstance(tresp, dict) and tresp.get("data"):
+                        data0 = tresp["data"][0]
+                        for k in ("last", "lastPx", "price", "c", "close"):
+                            if k in data0:
+                                price = safe_float(data0.get(k, 0.0), 0.0)
+                                break
+                except Exception:
+                    price = None
+                if price and price > 0:
+                    total_usdt += Decimal(str(eq)) * Decimal(str(price))
+                else:
+                    log_action("WS余额转换", f"无法在 WS 回调中转换 {ccy} -> USDT（视为 0）", "warning", {"ccy": ccy})
+        account_equity_usdt = float(total_usdt)
+        if initial_equity_usdt == 0.0:
+            initial_equity_usdt = account_equity_usdt
+        last_ws_price_update = time.time()
+        log_action("WS余额更新", f"账户余额 (USDT): {account_equity_usdt:.2f}", "debug")
+    except Exception as e:
+        log_action("WS balance处理", f"异常: {e}", "error", exc_info=True)
+
+
+def _handle_order_ws_entry(entry: dict):
+    try:
+        ord_id = entry.get("ordId") or entry.get("ordid") or ""
+        cl = entry.get("clOrdId") or entry.get("clordid") or ""
+        trade_id = entry.get("tradeId") or entry.get("trade_id") or ""
+        state = entry.get("state") or ""
+        req_id = entry.get("reqId") or entry.get("req_id") or ""
+        u_time = entry.get("uTime") or entry.get("u_time") or ""
+        fill_sz = safe_float(entry.get("fillSz", entry.get("fill_sz", 0)), 0.0)
+        acc_fill_sz = safe_float(entry.get("accFillSz", entry.get("acc_fill_sz", 0)), 0.0)
+        fill_px = safe_float(entry.get("fillPx", entry.get("fill_px", 0)), 0.0)
+        avg_px = safe_float(entry.get("avgPx", entry.get("avg_px", 0)), 0.0)
+
+        if req_id:
+            if req_id in seen_reqids:
+                log_action("WS订单", f"重复 reqId 推送，忽略 reqId={req_id}", "debug")
+                return
+            seen_reqids.add(req_id)
+
+        if trade_id:
+            if trade_id in seen_trade_ids:
+                log_action("WS订单", f"重复 tradeId 推送，忽略 tradeId={trade_id}", "debug")
+                return
+            seen_trade_ids.add(trade_id)
+
+        if not trade_id and state == "filled" and ord_id:
+            if ord_id in seen_filled_ordids:
+                log_action("WS订单", f"重复 filled 推送，忽略 ordId={ord_id}", "debug")
+                return
+            seen_filled_ordids.add(ord_id)
+
+        key = cl or ord_id or generate_order_id("ORDWS")
+        ao = active_orders.get(key, {})
+        ao.update({
+            "ord_id": ord_id,
+            "cl": cl,
+            "state": state,
+            "fillSz": fill_sz,
+            "accFillSz": acc_fill_sz,
+            "fillPx": fill_px,
+            "avgPx": avg_px,
+            "tradeId": trade_id,
+            "execType": entry.get("execType") or entry.get("exec_type"),
+            "px": entry.get("px"),
+            "sz": entry.get("sz"),
+            "tdMode": entry.get("tdMode"),
+            "uTime": u_time,
+            "raw_ws": entry,
+            "last_update": time.time()
+        })
+        active_orders[key] = ao
+
+        log_action("WS订单更新", f"更新订单 {key} state={state} fillSz={fill_sz} accFillSz={acc_fill_sz}", "info", {"ord": ord_id, "cl": cl, "tradeId": trade_id})
+
+    except Exception as e:
+        log_action("WS订单处理", f"异常: {e}", "error", exc_info=True)
+
+
+def _handle_fills_ws_entry(entry: dict):
+    try:
+        trade_id = entry.get("tradeId") or entry.get("trade_id") or ""
+        if not trade_id:
+            return
+        if trade_id in seen_trade_ids:
+            log_action("WS成交", f"重复 tradeId 推送（fills），忽略 tradeId={trade_id}", "debug")
+            return
+        seen_trade_ids.add(trade_id)
+
+        ord_id = entry.get("ordId") or entry.get("ordid") or ""
+        cl = entry.get("clOrdId") or entry.get("clordid") or ""
+        fill_sz = safe_float(entry.get("fillSz", 0), 0.0)
+        fill_px = safe_float(entry.get("fillPx", 0), 0.0)
+        ts = entry.get("ts") or entry.get("time") or ""
+        exec_type = entry.get("execType") or entry.get("exec_type")
+
+        key = cl or ord_id
+        if key and key in active_orders:
+            ao = active_orders[key]
+            ao["tradeId"] = trade_id
+            ao["fillSz"] = fill_sz
+            ao["fillPx"] = fill_px
+            ao["execType"] = exec_type
+            ao["last_fill_ts"] = ts
+            ao["last_update"] = time.time()
+            if entry.get("state") == "filled" or entry.get("accFillSz"):
+                ao["state"] = entry.get("state", ao.get("state"))
+            active_orders[key] = ao
+            log_action("WS成交更新", f"填充订单 {key} tradeId={trade_id} fillSz={fill_sz} fillPx={fill_px}", "info", {"ord": ord_id, "cl": cl})
+        else:
+            k2 = key or ord_id or generate_order_id("FILL")
+            active_orders[k2] = {
+                "ord_id": ord_id,
+                "cl": cl,
+                "tradeId": trade_id,
+                "fillSz": fill_sz,
+                "fillPx": fill_px,
+                "last_fill_ts": ts,
+                "last_update": time.time(),
+                "raw_fill": entry
+            }
+            log_action("WS成交新建", f"新增成交记录 {k2} tradeId={trade_id}", "debug", entry)
+
+    except Exception as e:
+        log_action("WS成交处理", f"异常: {e}", "error", exc_info=True)
+
+
+# 处理 WS op 下单 / 批量下单 的直接响应（op="order" / "batch-orders"）
+def _handle_ws_order_op_response(ws_message: dict):
+    try:
+        op = ws_message.get("op")
+        code = str(ws_message.get("code", ""))
+        data = ws_message.get("data", []) or []
+        if isinstance(data, dict):
+            data = [data]
+        log_action("WS下单响应", f"op={op} code={code}", "debug", ws_message)
+        for item in data:
+            cl = item.get("clOrdId") or item.get("clordid") or ""
+            ord_id = item.get("ordId") or item.get("ordid") or ""
+            s_code = None
+            for k in ("sCode", "scode", "SCODE", "code"):
+                if k in item:
+                    s_code = str(item.get(k, ""))
+                    break
+            s_msg = item.get("sMsg") or item.get("smsg") or ""
+            key = cl or ord_id or generate_order_id("WSORD")
+            ao = active_orders.get(key, {})
+            ao.update({
+                "ord_id": ord_id,
+                "cl": cl,
+                "ws_op": op,
+                "sCode": s_code,
+                "sMsg": s_msg,
+                "raw_ws_order_resp": item,
+                "last_update": time.time()
+            })
+            if s_code in ("0", "", None):
+                ao["state"] = "accepted"
+            else:
+                ao["state"] = "rejected"
+            active_orders[key] = ao
+            log_action("WS下单响应处理", f"记录订单 {key} sCode={s_code} ordId={ord_id}", "info", ao)
+    except Exception as e:
+        log_action("WS下单响应处理", f"异常: {e}", "error", exc_info=True)
+
+
+# 处理 WS 撤单 / 批量撤单 的直接响应（op="cancel-order" / "batch-cancel-orders"）
+def _handle_ws_cancel_op_response(ws_message: dict):
+    try:
+        op = ws_message.get("op")
+        code = str(ws_message.get("code", ""))
+        data = ws_message.get("data", []) or []
+        if isinstance(data, dict):
+            data = [data]
+        log_action("WS撤单响应", f"接收 op={op} code={code}", "debug", ws_message)
+        for item in data:
+            cl = item.get("clOrdId") or item.get("clordid") or ""
+            ord_id = item.get("ordId") or item.get("ordid") or ""
+            s_code = None
+            for k in ("sCode", "scode", "SCODE", "code"):
+                if k in item:
+                    s_code = str(item.get(k, ""))
+                    break
+            s_msg = item.get("sMsg") or item.get("smsg") or ""
+            key = cl or ord_id or generate_order_id("WSCANCEL")
+            ao = active_orders.get(key, {})
+            ao.update({
+                "ord_id": ord_id,
+                "cl": cl,
+                "ws_cancel_op": op,
+                "ws_cancel_sCode": s_code,
+                "ws_cancel_sMsg": s_msg,
+                "raw_ws_cancel_resp": item,
+                "last_update": time.time()
+            })
+            if s_code in ("0", "", None):
+                ao["state"] = "cancel_pending"
+                log_action("WS撤单处理", f"撤单请求已被接受，标记 cancel_pending key={key} ordId={ord_id}", "info", ao)
+            else:
+                ao["state"] = "cancel_rejected"
+                ao["cancel_reject_reason"] = s_msg
+                log_action("WS撤单处理", f"撤单被拒 key={key} ordId={ord_id} sCode={s_code} sMsg={s_msg}", "warning", ao)
+            active_orders[key] = ao
+    except Exception as e:
+        log_action("WS撤单响应处理", f"异常: {e}", "error", exc_info=True)
+
+
+def _ws_message_callback_enhanced(message: Any):
+    """
+    WS 私有频道通用回调，分发到 positions / balance_and_position / orders / fills / op(order/cancel)
+    """
+    try:
+        data = message
+        if isinstance(message, str):
+            try:
+                data = json.loads(message)
+            except Exception:
+                log_action("WS消息", "收到非 JSON 字符串消息", "debug", {"raw": message})
+                return
+        if "event" in data:
+            ev = data.get("event")
+            log_action("WS事件", f"event={ev}", "debug", data.get("arg"))
+            return
+
+        # 先处理 op-level 的下单/撤单响应
+        if "op" in data and data.get("op") in ("order", "batch-orders", "cancel-order", "batch-cancel-orders"):
+            opv = data.get("op")
+            if opv in ("order", "batch-orders"):
+                _handle_ws_order_op_response(data)
+            else:
+                _handle_ws_cancel_op_response(data)
+            return
+
+        arg = data.get("arg") or {}
+        channel = arg.get("channel") or data.get("channel")
+        if channel == "orders":
+            payload_list = data.get("data", [])
+            if isinstance(payload_list, dict):
+                payload_list = [payload_list]
+            for payload in payload_list:
+                if isinstance(payload, list):
+                    for it in payload:
+                        _handle_order_ws_entry(it)
+                else:
+                    _handle_order_ws_entry(payload)
+            return
+        if channel == "fills":
+            payload_list = data.get("data", [])
+            if isinstance(payload_list, dict):
+                payload_list = [payload_list]
+            for payload in payload_list:
+                _handle_fills_ws_entry(payload)
+            return
+        if channel in ("positions", "balance_and_position"):
+            payload_list = data.get("data", [])
+            if isinstance(payload_list, dict):
+                payload_list = [payload_list]
+            for payload in payload_list:
+                if channel == "positions":
+                    _handle_positions_ws_entry(payload)
+                else:
+                    _handle_balance_and_position_ws_entry(payload)
+            return
+
+        log_action("WS消息", f"未知频道: {channel}", "debug", data)
+    except Exception as e:
+        log_action("WS回调", f"处理消息异常: {e}", "error", exc_info=True)
+
+
+async def start_private_ws_enhanced():
+    """
+    启动私有 WS，订阅 positions, balance_and_position, orders, 可选 fills。
+    """
+    global _ws_instance
+    if PrivateWs is None:
+        log_action("WS", "WsPrivateAsync 不可用（SDK 未安装），跳过 WS 订阅", "warning")
+        return None
+    try:
+        ws = PrivateWs(apiKey=API_KEY, passphrase=PASSPHRASE, secretKey=SECRET_KEY, url="wss://ws.okx.com:8443/ws/v5/private", useServerTime=False)
+        await ws.start()
+        _ws_instance = ws
+        log_action("WS", "私有 WS 已启动", "info")
+        args = [
+            {"channel": "positions", "instType": "ANY"},
+            {"channel": "balance_and_position"},
+            {"channel": "orders", "instType": "ANY"}
+        ]
+        if ENABLE_FILLS_CHANNEL:
+            args.append({"channel": "fills"})
+        await ws.subscribe(args, callback=_ws_message_callback_enhanced)
+        log_action("WS", "已订阅: " + ", ".join(a.get("channel") for a in args), "info", {"sub_args": args})
+        try:
+            asyncio.create_task(get_pending_orders(instType=CONTRACT_INFO.get("instType", "SWAP"), instId=SYMBOL, limit=100))
+        except Exception:
+            pass
+        return ws
+    except Exception as e:
+        log_action("WS启动", f"启动或订阅失败: {e}", "error", exc_info=True)
+        return None
+
+
+async def stop_private_ws():
+    global _ws_instance
+    try:
+        if _ws_instance is None:
+            return
+        try:
+            await _ws_instance.stop()
+        except Exception:
+            pass
+        _ws_instance = None
+        log_action("WS", "私有 WS 已停止", "info")
+    except Exception as e:
+        log_action("WS停止", f"停止失败: {e}", "warning", exc_info=True)
+
+
+# -------------------- 通过 WS 发送下单 / 批量下单 / 撤单 的辅助（可选用） --------------------
+async def ws_send_order(ws, order_args: dict, msg_id: str = None):
+    if msg_id is None:
+        msg_id = generate_order_id("WSORD")
+    await check_rate_limit(1, max_per_window=60, window_seconds=2)
+    payload = {"id": msg_id, "op": "order", "args": [order_args]}
+    try:
+        if hasattr(ws, "request"):
+            await ws.request(payload)
+        elif hasattr(ws, "send"):
+            await ws.send(json.dumps(payload))
+        else:
+            await asyncio.to_thread(ws.send, json.dumps(payload))
+        log_action("WS下单发送", f"已发送 WS order id={msg_id}", "debug", payload)
+    except Exception as inner:
+        log_action("WS下单发送", f"发送失败: {inner}", "error", exc_info=True)
+
+
+async def ws_send_batch_orders(ws, orders: list, msg_id: str = None):
+    if msg_id is None:
+        msg_id = generate_order_id("WSBATCH")
+    await check_rate_limit(len(orders), max_per_window=300, window_seconds=2)
+    payload = {"id": msg_id, "op": "batch-orders", "args": orders}
+    try:
+        if hasattr(ws, "request"):
+            await ws.request(payload)
+        elif hasattr(ws, "send"):
+            await ws.send(json.dumps(payload))
+        else:
+            await asyncio.to_thread(ws.send, json.dumps(payload))
+        log_action("WS批量下单发送", f"已发送 WS batch-orders id={msg_id} orders={len(orders)}", "debug")
+    except Exception as e:
+        log_action("WS批量下单发送", f"发送异常: {e}", "error", exc_info=True)
+
+
+async def ws_send_cancel_order(ws, instId: str, ordId: str = None, clOrdId: str = None, msg_id: str = None):
+    if msg_id is None:
+        msg_id = generate_order_id("WSCXL")
+    await check_rate_limit(1, max_per_window=60, window_seconds=2)
+    payload = {"id": msg_id, "op": "cancel-order", "args": [{"instId": instId, "ordId": ordId or "", "clOrdId": clOrdId or ""}]}
+    try:
+        if hasattr(ws, "request"):
+            await ws.request(payload)
+        elif hasattr(ws, "send"):
+            await ws.send(json.dumps(payload))
+        else:
+            await asyncio.to_thread(ws.send, json.dumps(payload))
+        log_action("WS撤单发送", f"已发送 WS cancel-order id={msg_id} instId={instId} ordId={ordId} cl={clOrdId}", "debug", payload)
+    except Exception as e:
+        log_action("WS撤单发送", f"发送异常: {e}", "error", exc_info=True)
+
+
+async def ws_send_batch_cancel_orders(ws, requests: list, msg_id: str = None):
+    if msg_id is None:
+        msg_id = generate_order_id("WSBATCHCXL")
+    orders_count = len(requests)
+    await check_rate_limit(orders_count, max_per_window=300, window_seconds=2)
+    payload = {"id": msg_id, "op": "batch-cancel-orders", "args": requests}
+    try:
+        if hasattr(ws, "request"):
+            await ws.request(payload)
+        elif hasattr(ws, "send"):
+            await ws.send(json.dumps(payload))
+        else:
+            await asyncio.to_thread(ws.send, json.dumps(payload))
+        log_action("WS批量撤单发送", f"已发送 WS batch-cancel-orders id={msg_id} count={orders_count}", "debug")
+    except Exception as e:
+        log_action("WS批量撤单发送", f"发送异常: {e}", "error", exc_info=True)
+
+
+# -------------------- 公共行情 WS（tickers） --------------------
+def _public_ws_ticker_callback(message: Any):
+    global current_price, last_price, last_ws_price_update, price_source, best_bid, best_ask
+    try:
+        data = message
+        if isinstance(message, str):
+            try:
+                data = json.loads(message)
+            except Exception:
+                log_action("Public WS", "收到非 JSON 字符串消息（tickers）", "debug", {"raw": message})
                 return
 
-            # 调用业务处理回调
-            self.callback(message)
-        except Exception as e:
-            log_action("处理", f"处理消息出错: {str(e)}", "error")
+        if "event" in data:
+            ev = data.get("event")
+            log_action("Public WS 事件", f"event={ev}", "debug", data.get("arg"))
+            return
 
-    async def subscribe(self):
-        """订阅频道 - 增加详细日志"""
-        if not self.ws:
-            log_action("订阅", f"{self.channel_type}频道连接未建立，无法订阅", "error")
-            return False
+        arg = data.get("arg") or {}
+        channel = arg.get("channel") or data.get("channel")
+        if channel != "tickers":
+            return
 
-        try:
-            log_action("订阅", f"订阅频道: {self.subscribe_args}", "debug")
-            await self.ws.subscribe(self.subscribe_args, callback=self.handle_message)
-            self.subscribed = True
-            log_action("订阅", f"{self.channel_type}频道订阅成功", "info")
-            return True
-        except Exception as e:
-            log_action("订阅", f"{self.channel_type}频道订阅失败: {str(e)}", "error")
-            return False
+        payload_list = data.get("data", []) or []
+        if isinstance(payload_list, dict):
+            payload_list = [payload_list]
+        for payload in payload_list:
+            price = None
+            for k in ("last", "lastPx", "price", "c", "close"):
+                if k in payload:
+                    price = safe_float(payload.get(k), None)
+                    break
+            if price is None:
+                bid = safe_float(payload.get("bidPx", 0), 0.0)
+                ask = safe_float(payload.get("askPx", 0), 0.0)
+                if bid and ask:
+                    price = (bid + ask) / 2.0
+                elif bid:
+                    price = bid
+                elif ask:
+                    price = ask
 
-    async def send_ping(self):
-        """发送Ping消息 - 增加详细日志"""
-        if self.manual_disconnect:
-            log_action("发送", f"{self.channel_type}频道处于手动断开状态，不发送Ping", "info")
-            return False
+            if price is None:
+                log_action("Public WS tickers", "无法解析价格字段", "warning", payload)
+                continue
 
-        self.ping_count += 1
-        ping_num = self.ping_count
-        self.last_ping_time = time.time()
-        self.waiting_for_pong = True
+            best_bid = safe_float(payload.get("bidPx", best_bid), best_bid)
+            best_ask = safe_float(payload.get("askPx", best_ask), best_ask)
 
-        try:
-            # 使用底层WebSocket发送ping
-            log_action("发送", f"发送Ping (#{ping_num})", "debug")
-            await self.ws.websocket.send("ping")
-            log_action("发送", f"发送Ping (#{ping_num})", "info")
-            return True
-        except Exception as e:
-            log_action("发送", f"发送Ping (#{ping_num})失败: {str(e)}", "error")
-            # 发送失败直接触发重连
-            self.waiting_for_pong = False
-            await self.initiate_reconnect("发送失败")
-            return False
+            last_price = current_price
+            current_price = float(price)
+            last_ws_price_update = time.time()
+            price_source = "ws_ticker"
 
-    async def safe_close(self):
-        """安全关闭连接 - 增加详细日志"""
-        if self.ws:
             try:
-                if hasattr(self.ws, 'websocket') and self.ws.websocket:
-                    log_action("关闭", f"关闭{self.channel_type}频道WebSocket连接", "debug")
-                    await self.ws.websocket.close()
-                    log_action("关闭", f"{self.channel_type}频道WebSocket连接已关闭", "info")
-            except Exception as e:
-                log_action("关闭", f"关闭{self.channel_type}频道连接时出错: {str(e)}", "error")
-            finally:
-                self.ws = None
-                self.connected = False
-                self.subscribed = False
+                if last_price == 0 or abs(current_price - last_price) / max(1.0, last_price) > 0.0005:
+                    log_action("行情更新", f"WS tickers 价格更新: {last_price:.6f} -> {current_price:.6f}", "info",
+                               {"instId": arg.get("instId"), "bid": best_bid, "ask": best_ask, "ts": payload.get("ts")})
+                else:
+                    log_action("行情更新", "WS tickers 微幅变动（debug）", "debug", {"last": last_price, "now": current_price})
+            except Exception:
+                log_action("行情更新", "记录行情更新日志时异常", "debug", payload)
 
-    async def initiate_reconnect(self, reason=""):
-        """初始化重连过程 - 增加详细日志"""
-        if self.reconnect_in_progress:
-            log_action("重连", "重连已在进行中，跳过", "warning")
+    except Exception as e:
+        log_action("Public WS tickers 处理", f"异常: {e}", "error", exc_info=True)
+
+
+async def start_public_ws():
+    global _public_ws_instance
+    if not ENABLE_PUBLIC_TICKER:
+        log_action("Public WS", "ENABLE_PUBLIC_TICKER=False，跳过公共行情订阅", "info")
+        return None
+    if PublicWs is None:
+        log_action("Public WS", "WsPublicAsync 未安装，无法订阅 tickers（跳过）", "warning")
+        return None
+    try:
+        ws = PublicWs(url="wss://wspap.okx.com:8443/ws/v5/public")
+        await ws.start()
+        _public_ws_instance = ws
+        log_action("Public WS", "公共 WS 已启动", "info")
+        args = [{"channel": "tickers", "instId": SYMBOL}]
+        await ws.subscribe(args, callback=_public_ws_ticker_callback)
+        log_action("Public WS", "已订阅 tickers", "info", {"sub_args": args})
+        return ws
+    except Exception as e:
+        log_action("Public WS 启动", f"启动或订阅失败: {e}", "error", exc_info=True)
+        return None
+
+
+async def stop_public_ws():
+    global _public_ws_instance
+    try:
+        if _public_ws_instance is None:
             return
-
-        self.reconnect_in_progress = True
-        log_action("重连", f"触发重连: {reason}", "warning")
-
-        # 关闭现有连接
-        await self.safe_close()
-
-        # 重置状态
-        self.waiting_for_pong = False
-
-        # 尝试重连
-        if await self.reconnect():
-            self.reconnect_count += 1
-            log_action("重连", f"✅ 重新连接成功 (#{self.reconnect_count})", "info")
-        else:
-            log_action("重连", f"❌ 重新连接失败 (#{self.reconnect_count})", "error")
-
-        self.reconnect_in_progress = False
-
-    async def reconnect(self):
-        """执行重连逻辑 - 增加详细日志"""
         try:
-            log_action("连接", "尝试重新建立连接", "info")
-
-            # 尝试连接
-            if not await self.connect():
-                return False
-
-            # 重新订阅
-            if not await self.subscribe():
-                return False
-
-            return True
-        except Exception as e:
-            log_action("连接", f"重连失败: {str(e)}", "error")
-            return False
-
-    async def disconnect(self):
-        """手动断开连接 - 增加详细日志"""
-        log_action("断开", f"手动断开{self.channel_type}频道连接", "info")
-        self.manual_disconnect = True
-        await self.safe_close()
-        log_action("断开", f"{self.channel_type}频道连接已手动关闭", "info")
-
-    async def monitor_connection(self):
-        """监控连接状态并发送Ping - 增加详细日志"""
-        log_action("监控", f"启动{self.channel_type}频道监控任务", "info")
-
-        while self.running:
-            try:
-                current_time = time.time()
-
-                # 0. 如果手动断开连接，跳过检测
-                if self.manual_disconnect:
-                    await asyncio.sleep(1)
-                    continue
-
-                # 1. 检查连接是否有效
-                if not self.connected or not self.ws:
-                    log_action("监控", f"{self.channel_type}频道连接已断开，尝试重新连接", "warning")
-                    await self.initiate_reconnect("连接断开")
-                    await asyncio.sleep(1)  # 重连后稍作休息
-                    continue
-
-                # 2. 检查是否需要发送Ping
-                idle_time = current_time - self.last_message_time
-                if idle_time > self.ping_interval and not self.waiting_for_pong:
-                    log_action("监控", f"{idle_time:.1f}秒未收到消息，发送Ping", "warning")
-                    await self.send_ping()
-
-                # 3. 检查Pong响应是否超时
-                if self.waiting_for_pong:
-                    pong_wait_time = current_time - self.last_ping_time
-                    if pong_wait_time > self.pong_timeout:
-                        log_action("监控", f"Pong响应超时 ({pong_wait_time:.1f}秒)，尝试重新连接", "error")
-                        await self.initiate_reconnect("Pong超时")
-
-                await asyncio.sleep(1)
-            except Exception as e:
-                log_action("监控", f"监控出错: {str(e)}", "error")
-                await asyncio.sleep(1)
-
-
-# ======================== 全局管理器实例 ========================
-public_manager = None
-private_manager = None
-
-
-# ======================== WebSocket初始化 ========================
-async def setup_websockets():
-    """初始化WebSocket连接并订阅必要频道 - 增加详细日志"""
-    global public_manager, private_manager
-    log_action("WebSocket初始化", "启动WebSocket连接...")
-
-    try:
-        # 创建公共频道管理器
-        public_manager = WebSocketManager(
-            channel_type="public",
-            ws_class=PublicWs,
-            subscribe_args=[{"channel": "tickers", "instId": SYMBOL}],
-            callback=handle_tickers
-        )
-
-        # 创建私有频道管理器
-        private_manager = WebSocketManager(
-            channel_type="private",
-            ws_class=PrivateWs,
-            subscribe_args=[{"channel": "orders", "instType": "SWAP", "instId": SYMBOL}],
-            callback=handle_orders
-        )
-
-        # 连接并订阅
-        if not await public_manager.connect() or not await public_manager.subscribe():
-            return False
-
-        if not await private_manager.connect() or not await private_manager.subscribe():
-            return False
-
-        # 启动监控任务
-        public_manager.monitor_task = asyncio.create_task(public_manager.monitor_connection())
-        private_manager.monitor_task = asyncio.create_task(private_manager.monitor_connection())
-
-        log_action("WebSocket状态", "连接和订阅成功", "info")
-        return True
+            await _public_ws_instance.stop()
+        except Exception:
+            pass
+        _public_ws_instance = None
+        log_action("Public WS", "公共 WS 已停止", "info")
     except Exception as e:
-        log_action("WebSocket", f"连接失败: {str(e)}", "error", exc_info=True)
-        return False
+        log_action("Public WS 停止", f"停止失败: {e}", "warning", exc_info=True)
 
 
-# ======================== 消息处理函数 (重构) ========================
-def handle_orders(message):
-    """处理订单频道消息 - 支持订单对原子性操作 - 增加详细日志"""
-    # 跳过Pong响应（已在管理器处理）
-    if "pong" in message:
-        return
+# -------------------- 主循环与监控 --------------------
+def log_periodic_status():
+    long_key = f"{CONTRACT_INFO.get('symbol')}-long"
+    short_key = f"{CONTRACT_INFO.get('symbol')}-short"
+    long_pos = position_info[long_key]["pos"] if long_key in position_info else 0.0
+    short_pos = position_info[short_key]["pos"] if short_key in position_info else 0.0
+    logger.info("\n" + "=" * 80)
+    logger.info(f"📊 状态 - 方向: {trading_direction} - 多: {long_pos} - 空: {short_pos} - 余额(USDT): {account_equity_usdt:.2f}")
+    logger.info("=" * 80 + "\n")
 
-    try:
-        # 记录原始消息
-        log_action("订单处理", "收到订单消息", "debug", {"原始消息": message})
 
-        data = json.loads(message)
-        arg = data.get("arg", {})
-        if arg.get("channel") != "orders" or arg.get("instId") != SYMBOL:
+async def main_loop_once():
+    if not INSTRUMENTS_LOADED:
+        ok = await fetch_instrument_info_from_api()
+        if not ok:
+            log_action("主流程", "未能加载合约元数据，进入 Dry-run 模式（不会下单）", "warning")
+            await update_current_price()
+            await fetch_account_balance()
+            await update_position_info()
+            log_periodic_status()
             return
-
-        orders = data.get("data", [])
-        log_action("订单处理", f"处理{len(orders)}个订单更新", "debug")
-
-        for order_data in orders:
-            try:
-                # 安全获取并验证关键字段
-                cl_ord_id = order_data.get("clOrdId", "")
-                state = order_data.get("state", "")
-                ord_id = order_data.get("ordId", "")
-                pos_side = order_data.get("posSide", "unknown").lower()
-                side = order_data.get("side", "unknown").lower()
-
-                # 安全处理数量字段
-                fill_sz_str = str(order_data.get("fillSz", "0") or "0")
-                fill_px_str = str(order_data.get("fillPx", "0") or "0")
-
-                # 转换为数值类型（带错误处理）
-                try:
-                    fill_sz = float(fill_sz_str)
-                except (ValueError, TypeError):
-                    fill_sz = 0.0
-
-                try:
-                    fill_px = float(fill_px_str)
-                except (ValueError, TypeError):
-                    fill_px = 0.0
-
-                # 计算ETH价值
-                eth_value = calculate_contract_value(fill_sz)
-
-                # 跳过无效订单ID或状态
-                if not cl_ord_id or not state:
-                    continue
-
-                # 更新订单状态
-                if cl_ord_id in active_orders:
-                    old_state = active_orders[cl_ord_id].get("state", "")
-                    if old_state != state:
-                        # 详细记录状态变化
-                        log_action("订单状态",
-                                   f"{cl_ord_id} {old_state} → {state}",
-                                   "info", {
-                                       "tag": active_orders[cl_ord_id].get("tag", ""),
-                                       "side": side,
-                                       "pos_side": pos_side,
-                                       "fill_sz": f"{fill_sz}张 ({eth_value:.6f} ETH)",
-                                       "fill_px": fill_px
-                                   })
-
-                    active_orders[cl_ord_id]["state"] = state
-
-                    # 处理已完成订单
-                    if state in ["filled", "canceled", "expired", "failed"]:
-                        # 检查是否有订单对关联
-                        if "pair_id" in active_orders[cl_ord_id]:
-                            pair_id = active_orders[cl_ord_id]["pair_id"]
-
-                            # 记录订单对信息
-                            log_action("订单对检查", f"订单 {cl_ord_id} 属于订单对 {pair_id}", "debug",
-                                       {"pair_id": pair_id, "order_data": order_data})
-
-                            if pair_id in order_pair_mapping:
-                                # 确定另一个订单的cl_ord_id
-                                other_cl_ord_id = None
-                                if order_pair_mapping[pair_id]["open_cl_ord_id"] == cl_ord_id:
-                                    other_cl_ord_id = order_pair_mapping[pair_id]["close_cl_ord_id"]
-                                elif order_pair_mapping[pair_id]["close_cl_ord_id"] == cl_ord_id:
-                                    other_cl_ord_id = order_pair_mapping[pair_id]["open_cl_ord_id"]
-
-                                if other_cl_ord_id:
-                                    log_action("订单对管理", f"取消关联订单 {other_cl_ord_id}", "info")
-                                    asyncio.create_task(cancel_single_order(other_cl_ord_id))
-                                else:
-                                    log_action("订单对错误", f"无法找到关联订单: {pair_id}", "error",
-                                               {"order_pair": order_pair_mapping[pair_id]})
-
-                                # 移除订单对记录
-                                del order_pair_mapping[pair_id]
-                                log_action("订单对清理", f"已移除订单对映射: {pair_id}", "info")
-                            else:
-                                log_action("订单对警告", f"订单对 {pair_id} 不存在于映射中", "warning")
-                        else:
-                            log_action("订单对检查", f"订单 {cl_ord_id} 没有pair_id字段", "debug")
-
-                        # 移除订单记录
-                        if cl_ord_id in active_orders:
-                            del active_orders[cl_ord_id]
-                        log_action("订单完成", f"{cl_ord_id} 已移除，状态: {state}")
-
-                # 处理成交订单 - 更新仓位
-                if state == "filled" and fill_sz > 0:
-                    log_action("订单成交",
-                               f"{cl_ord_id} | 数量: {fill_sz}张 ({eth_value:.6f} ETH) | 价格: ${fill_px:.4f}")
-
-                    # 确定仓位方向
-                    if pos_side not in ["long", "short"]:
-                        continue
-
-                    pos_key = get_position_key(SYMBOL, pos_side)
-
-                    # 开仓单：增加仓位
-                    if (side == "buy" and pos_side == "long") or (side == "sell" and pos_side == "short"):
-                        position_info[pos_key]["pos"] += fill_sz
-                        position_info[pos_key]["eth_value"] = calculate_contract_value(position_info[pos_key]["pos"])
-                        position_info[pos_key]["avg_px"] = fill_px
-                        position_info[pos_key]["entry_time"] = time.time()
-                        log_action("仓位增加",
-                                   f"{pos_side}仓 +{fill_sz}张 ({eth_value:.6f} ETH) | 均价: ${fill_px:.4f}")
-
-                    # 平仓单：减少仓位
-                    elif (side == "sell" and pos_side == "long") or (side == "buy" and pos_side == "short"):
-                        position_info[pos_key]["pos"] = max(0,
-                                                            position_info[pos_key]["pos"] - fill_sz)
-                        position_info[pos_key]["eth_value"] = calculate_contract_value(position_info[pos_key]["pos"])
-                        log_action("仓位减少",
-                                   f"{pos_side}仓 -{fill_sz}张 ({eth_value:.6f} ETH) | 剩余: {position_info[pos_key]['pos']}张")
-
-            except Exception as inner_e:
-                # 记录订单处理中的内部错误
-                log_action("订单项处理",
-                           f"处理单个订单出错: {str(inner_e)}",
-                           "error",
-                           {"order_data": order_data})
-    except Exception as outer_e:
-        # 记录整体处理错误
-        log_action("订单处理", f"处理消息出错: {str(outer_e)}", "error", exc_info=True)
-
-
-def handle_tickers(message):
-    """处理行情数据 - 增强版本 - 增加详细日志"""
-    global current_price, last_price, last_ws_price_update, price_source
-
-    # 跳过Pong响应（已在管理器处理）
-    if "pong" in message:
-        return
-
-    try:
-        # 记录原始消息
-        log_action("行情处理", "收到行情消息", "debug", {"原始消息": message})
-
-        data = json.loads(message)
-        arg = data.get("arg", {})
-        if arg.get("channel") != "tickers" or arg.get("instId") != SYMBOL:
-            return
-
-        tickers = data.get("data", [])
-        if not tickers:
-            return
-
-        ticker = tickers[0]
-        price = float(ticker.get("last", "0"))
-
-        # 验证价格有效性
-        if price <= 0:
-            return
-
-        # 更新价格和时间戳
-        last_price = current_price
-        current_price = price
-        last_ws_price_update = time.time()
-        price_source = "websocket"
-
-        # 记录价格变化（仅记录显著变化）
-        if last_price > 0 and abs(price - last_price) / last_price > 0.001:  # 超过0.1%变化才记录
-            change = ((price - last_price) / last_price * 100)
-            log_action("价格更新", f"{price_source} → ${last_price:.4f} → ${price:.4f} ({change:+.2f}%)", "debug")
-    except Exception as e:
-        log_action("行情处理", f"处理出错: {str(e)}", "error", exc_info=True)
-
-
-# ======================== 策略状态处理 ========================
-async def handle_trading_phase():
-    global trading_phase, last_trend_check
-
-    try:
-        # 记录当前阶段
-        log_action("阶段处理", f"当前阶段: {trading_phase}", "debug")
-
-        # 记录周期性状态摘要
-        log_periodic_status()
-
-        # 检查趋势变化
-        await analyze_trend()
-
-        # 处理各阶段逻辑
-        if trading_phase == TradingPhase.INIT:
-            await handle_init_phase()
-        elif trading_phase == TradingPhase.A1_POSITION_SETUP:
-            await handle_A1_phase()
-        elif trading_phase == TradingPhase.A2_ORDER_PAIR:
-            await handle_A2_phase()
-        elif trading_phase == TradingPhase.B2_WAIT_PAIR:
-            # 直接在这里检查订单对状态
-            if not order_pair_mapping:
-                log_action("阶段转换", "检测到无活跃订单对，返回A1阶段", "info")
-                log_state_transition("B2_WAIT_PAIR", "A1_POSITION_SETUP", "订单对完成")
-                trading_phase = TradingPhase.A1_POSITION_SETUP
-            else:
-                # 正常监控订单对
-                await asyncio.sleep(0.5)
-                log_action("B2监控", f"活跃订单对: {len(order_pair_mapping)}个", "debug")
-
-    except Exception as e:
-        log_action("阶段处理", f"处理失败: {str(e)}", "error", exc_info=True)
-        return False
-
-
-async def handle_init_phase():
-    """初始化阶段 - 增加详细日志"""
-    global trading_phase
-    log_action("INIT", "开始系统初始化")
-
-    try:
-        # 1. 获取账户信息
-        if not await fetch_account_balance():
-            log_action("INIT", "账户查询失败，5秒后重试", "warning")
-            await asyncio.sleep(5)
-            return False
-
-        # 2. 获取当前价格
-        await update_current_price()
-
-        # 3. 初始化Supertrend分析器
-        await supertrend_analyzer.initialize_with_history()
-        log_action("Supertrend", "历史数据初始化完成", "info")
-
-        # 4. 分析初始趋势
-        await analyze_trend()
-
-        # 5. 更新仓位信息
-        await update_position_info()
-
-        # 6. 验证开仓增量配置
-        validate_order_increment()
-        log_action("配置验证", f"开仓增量: {TRADE_STRATEGY['order_increment']}张", "info")
-
-        # 7. 进入A1阶段
-        log_state_transition("INIT", "A1_POSITION_SETUP", "初始化完成")
-        trading_phase = TradingPhase.A1_POSITION_SETUP
-        return True
-    except Exception as e:
-        log_action("INIT", f"初始化失败: {str(e)}", "error", exc_info=True)
-        await asyncio.sleep(5)
-        return False
-
-
-async def handle_A1_phase():
-    """A1阶段: 确保仓位与当前趋势匹配 - 增加详细日志"""
-    global trading_phase
-
-    # 从配置中获取目标仓位大小（合约张数）
-    target_size = get_position_size()
-    target_eth = calculate_contract_value(target_size)
-
-    # 获取当前仓位信息
-    pos_key = get_position_key(SYMBOL, trading_direction)
-    current_pos = position_info[pos_key]["pos"]
-    current_eth = calculate_contract_value(current_pos)
-
-    # 记录详细仓位状态
-    log_action("A1仓位检查",
-               f"目标仓位: {target_size}张 ({target_eth:.6f} ETH) | 当前仓位: {current_pos}张 ({current_eth:.6f} ETH)",
-               "info",
-               {"trading_direction": trading_direction})
-
-    # 检查仓位是否已达目标
-    if current_pos >= target_size:
-        log_action("A1仓位确认",
-                   f"当前仓位({current_pos}张, {current_eth:.6f} ETH)已达目标({target_size}张, {target_eth:.6f} ETH)，进入A2阶段",
-                   "info")
-        log_state_transition("A1_POSITION_SETUP", "A2_ORDER_PAIR", "仓位已就绪")
-        trading_phase = TradingPhase.A2_ORDER_PAIR
-        return
-
-    # 计算需要建仓的数量
-    adjust_size = max(0, target_size - current_pos)
-    adjust_eth = calculate_contract_value(adjust_size)
-
-    # 确保数量有效
-    if adjust_size <= 0:
-        log_action("A1仓位", "计算仓位调整量为0，跳过建仓", "warning")
-        return
-
-    # 执行市价建仓
-    log_action("A1仓位建立",
-               f"当前仓位({current_pos}张, {current_eth:.6f} ETH)不足目标({target_size}张, {target_eth:.6f} ETH)，市价建仓{adjust_size}张 ({adjust_eth:.6f} ETH)...",
-               "warning")
-
-    if await place_market_setup_order(adjust_size):
-        # 等待仓位更新
-        await asyncio.sleep(1)
-        await update_position_info()
-
-        # 检查建仓后仓位
-        new_pos = position_info[pos_key]["pos"]
-        new_eth = calculate_contract_value(new_pos)
-        log_action("A1仓位更新", f"建仓后仓位: {new_pos}张 ({new_eth:.6f} ETH)", "info")
-
-        # 如果仓位仍不足，等待下次循环处理
-        if new_pos < target_size:
-            log_action("A1仓位",
-                       f"仓位仍不足({new_pos}/{target_size}张, {new_eth:.6f}/{target_eth:.6f} ETH)，等待下次处理",
-                       "warning")
-            return
-
-        # 仓位达标后进入A2阶段
-        log_action("A1仓位完成", f"仓位已达目标({new_pos}张, {new_eth:.6f} ETH)，进入A2阶段", "info")
-        log_state_transition("A1_POSITION_SETUP", "A2_ORDER_PAIR", "仓位已就绪")
-        trading_phase = TradingPhase.A2_ORDER_PAIR
-    else:
-        log_action("A1", "建仓失败，5秒后重试", "error")
-        await asyncio.sleep(5)
-
-
-async def handle_A2_phase():
-    """A2阶段: 挂订单对 - 增加详细日志"""
-    global trading_phase
-
-    # 检查是否已有活跃订单对
-    if order_pair_mapping:
-        active_pairs = sum(1 for p in order_pair_mapping.values() if p["status"] == "active")
-        if active_pairs > 0:
-            log_action("A2", f"已有{active_pairs}个活跃订单对，跳过挂单", "debug")
-            await asyncio.sleep(1)
-            return
-
-    # 挂新的原子订单对
-    log_action("A2挂单", "提交订单...", "info")
-    if await place_order_pair():
-        log_state_transition("A2_ORDER_PAIR", "B2_WAIT_PAIR", "订单对挂单成功")
-        trading_phase = TradingPhase.B2_WAIT_PAIR
-    else:
-        log_action("A2", "订单对挂单失败，10秒后重试", "error")
-        await asyncio.sleep(10)
-
-
-async def handle_B2_phase():
-    """B2阶段: 监控订单对状态 - 增加详细日志"""
-    # 主要依赖WebSocket回调处理
-    await asyncio.sleep(0.5)
-
-    # 记录当前订单对状态
-    active_pairs = len(order_pair_mapping)
-    log_action("B2监控", f"活跃订单对: {active_pairs}个", "debug")
-
-    # 如果没有活跃订单对，返回A1阶段
-    if not order_pair_mapping:
-        log_action("B2", "无活跃订单对，返回A1阶段", "info")
-        log_state_transition("B2_WAIT_PAIR", "A1_POSITION_SETUP", "订单对完成")
-        trading_phase = TradingPhase.A1_POSITION_SETUP
-        return True  # 关键：返回True表示阶段已完成
-    return False  # 返回False表示阶段仍需继续
-
-
-# ======================== 主循环 ========================
-async def core_strategy_loop():
-    """策略主循环 - 增加详细日志"""
-    if not await setup_websockets():
-        log_action("系统错误", "WebSocket初始化失败", "critical")
-        return
-
-    log_action("系统启动", f"智能趋势交易启动 | {SYMBOL} | {trading_direction.upper()}")
-
-    # 初始化时间记录
-    last_trend_check = time.time()
-
+    await update_current_price()
+    await fetch_account_balance()
+    await update_position_info()
+    if not active_orders:
+        log_action("主流程", "无活跃订单（或仅观测模式），当前不会主动下单（策略留空）", "info")
+    log_periodic_status()
+
+
+async def main_loop_continuous():
+    # 启动私有 WS 与公共 WS（如果启用）
+    ws_task = None
+    public_task = None
+    if not USE_MOCK and PrivateWs is not None:
+        ws_task = asyncio.create_task(start_private_ws_enhanced())
+    if not USE_MOCK and PublicWs is not None and ENABLE_PUBLIC_TICKER:
+        public_task = asyncio.create_task(start_public_ws())
     try:
         while True:
             try:
-                # 处理当前交易阶段
-                await handle_trading_phase()
-                # 休眠1秒
-                await asyncio.sleep(1)
+                await main_loop_once()
             except Exception as e:
-                log_action("主循环", f"严重错误: {str(e)}", "error", exc_info=True)
-                await asyncio.sleep(5)
+                log_action("主循环", f"异常: {e}", "error", exc_info=True)
+            await asyncio.sleep(5)
     finally:
-        # 安全关闭WebSocket连接
-        if public_manager:
-            public_manager.running = False
-            await public_manager.safe_close()
-        if private_manager:
-            private_manager.running = False
-            await private_manager.safe_close()
+        if ws_task:
+            try:
+                await stop_private_ws()
+            except Exception:
+                pass
+        if public_task:
+            try:
+                await stop_public_ws()
+            except Exception:
+                pass
 
 
-# ======================== 程序入口 ========================
-def run_application():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        log_action("系统启动", "=" * 80)
-        log_action("系统启动", "🔥 智能趋势交易系统启动")
-        log_action("系统启动", f"  交易对: {SYMBOL}")
-        log_action("系统启动", f"  目标ETH持仓: {TRADE_STRATEGY['eth_position']:.6f} ETH")
-        log_action("系统启动", f"  开仓增量: {TRADE_STRATEGY['order_increment']}张")
-        log_action("系统启动", f"  价格偏移: {TRADE_STRATEGY['price_offset'] * 100:.2f}%")
-        log_action("系统启动", "=" * 80)
-
-        loop.run_until_complete(core_strategy_loop())
-    except KeyboardInterrupt:
-        log_action("系统", "用户中断程序", "info")
-    except Exception as e:
-        log_action("系统", f"未处理异常: {str(e)}", "critical", exc_info=True)
-    finally:
-        # 安全关闭所有连接
-        if public_manager:
-            public_manager.running = False
-            loop.run_until_complete(public_manager.safe_close())
-        if private_manager:
-            private_manager.running = False
-            loop.run_until_complete(private_manager.safe_close())
-
-        loop.close()
-        log_action("系统", "✅ 程序结束", "info")
+# -------------------- 客户端初始化 --------------------
+def initialize_clients():
+    global account_api, trade_api, market_api
+    if USE_MOCK:
+        account_api = MockAccountAPI()
+        trade_api = MockTradeAPI()
+        market_api = MockMarketAPI()
+        log_action("初始化", "使用 Mock APIs (USE_MOCK=1)", "info")
+    else:
+        if Account is None or Trade is None or MarketData is None:
+            log_action("初始化", "OKX SDK 未安装且 USE_MOCK=False，无法继续", "error")
+            raise RuntimeError("OKX SDK not installed; set USE_MOCK=1 to run mock mode")
+        account_api = Account.AccountAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, OKX_FLAG)
+        trade_api = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, OKX_FLAG)
+        market_api = MarketData.MarketAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, OKX_FLAG)
+        log_action("初始化", f"已初始化 OKX SDK (flag={OKX_FLAG})", "info")
 
 
+# -------------------- 程序入口 --------------------
 if __name__ == "__main__":
-    run_application()
-    
+    initialize_clients()
+    log_action("程序启动", f"模式: OKX_FLAG={OKX_FLAG}, USE_MOCK={USE_MOCK}", "info")
+    if RUN_FOREVER:
+        asyncio.run(main_loop_continuous())
+    else:
+        asyncio.run(main_loop_once())
